@@ -7,7 +7,7 @@ export const SITE_FOOTER_HTML = `
     <span class="site-footer-sep" aria-hidden="true">·</span>
     <a href="/terms.html">Terms of Service</a>
     <span class="site-footer-sep" aria-hidden="true">·</span>
-    <a href="https://buy.stripe.com/fZu28q9eOgbJ7XF6ip2cg00" target="_blank" rel="noopener noreferrer">Donate to the Developer</a>
+    <a href="https://donate.stripe.com/7sYcN42Qq9Nl1zheOV2cg01" target="_blank" rel="noopener noreferrer">Donate to the Developer</a>
   </nav>
 </footer>
 `;

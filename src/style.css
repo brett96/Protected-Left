@@ -552,6 +552,77 @@ button.secondary {
   font-size: 0.72rem;
 }
 
+.nav-actions {
+  margin-top: 0.6rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem 0.75rem;
+  align-items: center;
+}
+
+.nav-toggle-btn {
+  min-height: 44px;
+  padding: 0.45rem 0.75rem;
+  border-radius: 10px;
+  border: 1px solid var(--accent-dim);
+  background: linear-gradient(180deg, #2ea043 0%, var(--accent-dim) 100%);
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.nav-toggle-btn:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.nav-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+  user-select: none;
+}
+
+.nav-option input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+.nav-live {
+  margin-top: 0.65rem;
+  border-top: 1px solid var(--border);
+  padding-top: 0.55rem;
+}
+
+.nav-live-label {
+  color: var(--muted);
+  font-size: 0.75rem;
+  margin-bottom: 0.15rem;
+}
+
+.nav-live-text {
+  color: var(--text);
+  font-size: 0.85rem;
+  line-height: 1.35;
+}
+
+.toggle-option {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+  user-select: none;
+  cursor: pointer;
+  padding: 0.25rem 0.2rem;
+}
+
+.toggle-option input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 18px;
+  height: 18px;
+}
+
 .panel p {
   margin: 0 0 0.5rem;
 }

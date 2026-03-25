@@ -30,7 +30,10 @@ export function countLeftTurnsFromRoute(route: RoutableForLeftCount): number {
   for (const leg of route.legs ?? []) {
     for (const step of leg.steps ?? []) {
       const mod = step.maneuver?.modifier;
-      if (mod && LEFT_MODIFIERS.has(mod)) n++;
+      if (!mod) continue;
+      const m = mod.toLowerCase();
+      // Be defensive: OSRM's modifier vocabulary can vary by region/dataset.
+      if (LEFT_MODIFIERS.has(mod) || m.includes("uturn") || m.includes("left")) n++;
     }
   }
   return n;
@@ -84,6 +87,79 @@ export function summarizeAndPickBest(routes: RoutableForLeftCount[]): {
     }
   }
   return { summaries, best: summaries[bestIdx]! };
+}
+
+export type OnlyRightTurnsPick = {
+  summaries: OsrmRouteSummary[];
+  /** Selected route by the chosen constraints. */
+  best: OsrmRouteSummary | null;
+  /**
+   * True when we found at least one strict candidate (leftTurns === 0),
+   * false when we had to fall back to the “best available” route.
+   */
+  strict: boolean;
+  /** Route indices in `summaries` that are allowed in the UI. */
+  allowedIndices: number[];
+};
+
+/**
+ * Picks a route that avoids leftward maneuvers as much as possible.
+ *
+ * Strict mode means we only consider routes with `leftTurns === 0`
+ * (including U-turns).
+ */
+export function summarizeAndPickOnlyRightTurnsBest(
+  routes: RoutableForLeftCount[],
+): OnlyRightTurnsPick {
+  if (routes.length === 0) {
+    return { summaries: [], best: null, strict: false, allowedIndices: [] };
+  }
+
+  const summaries: OsrmRouteSummary[] = new Array(routes.length);
+  let bestOverallIdx = 0;
+  let bestStrictIdx: number | null = null;
+
+  for (let i = 0; i < routes.length; i++) {
+    const route = routes[i]!;
+    const s: OsrmRouteSummary = {
+      index: i,
+      leftTurns: countLeftTurnsFromRoute(route),
+      durationSec: route.duration,
+      distanceM: route.distance,
+    };
+    summaries[i] = s;
+
+    if (i > 0 && isBetterCandidate(s, summaries[bestOverallIdx]!)) {
+      bestOverallIdx = i;
+    }
+
+    if (s.leftTurns === 0) {
+      if (bestStrictIdx === null) {
+        bestStrictIdx = i;
+      } else {
+        // For strict candidates: tie-break like normal, but only among leftTurns==0 routes.
+        const cur = summaries[i]!;
+        const prev = summaries[bestStrictIdx]!;
+        if (
+          cur.leftTurns !== prev.leftTurns ||
+          (cur.leftTurns === prev.leftTurns &&
+            (cur.durationSec !== prev.durationSec
+              ? cur.durationSec < prev.durationSec
+              : cur.distanceM < prev.distanceM))
+        ) {
+          bestStrictIdx = i;
+        }
+      }
+    }
+  }
+
+  const strict = bestStrictIdx !== null;
+  const allowedIndices = strict
+    ? summaries.filter((s) => s.leftTurns === 0).map((s) => s.index)
+    : summaries.map((s) => s.index);
+  const best = strict ? summaries[bestStrictIdx!] : summaries[bestOverallIdx]!;
+
+  return { summaries, best, strict, allowedIndices };
 }
 
 export function formatDuration(sec: number): string {
