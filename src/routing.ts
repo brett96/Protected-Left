@@ -91,6 +91,19 @@ export function summarizeAndPickBest(routes: RoutableForLeftCount[]): {
   return { summaries, best: summaries[bestIdx]! };
 }
 
+/** Fastest route by duration, then shortest distance (ignores left-turn count). */
+export function pickFastestFromSummaries(summaries: OsrmRouteSummary[]): OsrmRouteSummary | null {
+  if (summaries.length === 0) return null;
+  let bestIdx = 0;
+  for (let i = 1; i < summaries.length; i++) {
+    const a = summaries[i]!;
+    const b = summaries[bestIdx]!;
+    if (a.durationSec < b.durationSec) bestIdx = i;
+    else if (a.durationSec === b.durationSec && a.distanceM < b.distanceM) bestIdx = i;
+  }
+  return summaries[bestIdx]!;
+}
+
 export type OnlyRightTurnsPick = {
   summaries: OsrmRouteSummary[];
   /** Selected route by the chosen constraints. */

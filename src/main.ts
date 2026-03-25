@@ -10,6 +10,7 @@ import {
   formatDistance,
   formatDuration,
   instructionFromOsrmStep,
+  pickFastestFromSummaries,
   summarizeAndPickBest,
   summarizeRoutes,
   type OsrmRouteSummary,
@@ -782,7 +783,9 @@ function buildApp() {
 
     const suggestedNote =
       activeIndex === bestIndex
-        ? `<div class="route-picked-note">Suggested: fewest left turns among these options</div>`
+        ? sess.onlyRightMode
+          ? `<div class="route-picked-note">Baseline: fastest driving option among OSRM alternatives (right-turn optimization applied when needed).</div>`
+          : `<div class="route-picked-note">Suggested: fewest left turns among these options</div>`
         : "";
 
     const others = summaries.filter((s) => s.index !== activeIndex && allowedSet.has(s.index));
@@ -1074,8 +1077,8 @@ function buildApp() {
         let best: OsrmRouteSummary | null;
 
         if (onlyRightMode) {
-          const optimalPick = summarizeAndPickBest(routes);
-          best = optimalPick.best;
+          summaries = summarizeRoutes(routes);
+          best = pickFastestFromSummaries(summaries);
 
           if (!best) {
             hideRouteOverlay();
@@ -1120,7 +1123,6 @@ function buildApp() {
               allowedIndices = [best.index];
             }
           } else {
-            summaries = optimalPick.summaries;
             strictOnlyRight = true;
             allowedIndices = [best.index];
           }

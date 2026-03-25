@@ -1,7 +1,7 @@
 /**
- * Only-right-turns rewrite: replace each left / risky maneuver with a three-right
- * "around the block" path, using OSRM bearings (or geometry), then snap waypoints
- * to the drivable network via OSRM Nearest before routing.
+ * Only-right-turns rewrite: replace each left / risky maneuver with a jug-handle
+ * path (straight past the intersection, then three rights), using OSRM bearings,
+ * then snap waypoints to the drivable network via OSRM Nearest before routing.
  */
 
 import {
@@ -149,21 +149,24 @@ export function flattenDetourSteps(route: DetourRouteInput): FlatDetourStep[] {
 
 function defaultLegMeters(step: FlatDetourStep, isUturn: boolean): number {
   const d = step.stepDistanceM;
-  const base = Math.min(200, Math.max(38, Math.min(d * 0.52, 150)));
+  const base = Math.min(200, Math.max(90, Math.min(d * 0.52, 150)));
   return isUturn ? Math.min(240, base * 1.4) : base;
 }
 
 /**
- * Three sequential right turns at the intersection: bearings B0+90, B0+180, B0+270.
- * Replaces one left turn with a rectangular detour of side length `legM`.
+ * Jug-handle / "three right" detour: go straight past the intersection first, then
+ * three right turns so the router does not loop in place before the left.
  */
 export function buildThreeRightCorners(lat: number, lon: number, bearingBeforeDeg: number, legM: number): LatLon[] {
   const B0 = ((bearingBeforeDeg % 360) + 360) % 360;
   const d = legM;
-  const p1 = destinationPoint(lat, lon, (B0 + 90) % 360, d);
+
+  const forwardPt = destinationPoint(lat, lon, B0, d);
+  const p1 = destinationPoint(forwardPt.lat, forwardPt.lon, (B0 + 90) % 360, d);
   const p2 = destinationPoint(p1.lat, p1.lon, (B0 + 180) % 360, d);
-  const p3 = destinationPoint(p2.lat, p2.lon, (B0 + 270) % 360, d);
-  return [p1, p2, p3];
+  const p3 = destinationPoint(p2.lat, p2.lon, (B0 + 270) % 360, d * 0.6);
+
+  return [forwardPt, p1, p2, p3];
 }
 
 type NearestResponse = {
@@ -265,10 +268,8 @@ type WaypointOpts = {
 /**
  * Detour waypoints for one left maneuver (three-right pattern or nudge fallback).
  *
- * Generates candidate detour corners at multiple scales (standard, 72%, 150%) plus
- * a nudge fallback, then snaps ALL candidates to roads in one parallel batch.
- * This is dramatically faster than sequential snapping -- one network round-trip
- * instead of up to nine.
+ * Generates candidate jug-handle corners at multiple scales (1x, 1.5x, 2x leg)
+ * plus a nudge fallback, then snaps ALL candidates to roads in one parallel batch.
  */
 async function waypointsForOneTurn(
   osrmBaseUrl: string,
@@ -298,13 +299,14 @@ async function waypointsForOneTurn(
 
   const GROUP_NUDGE = -1;
   const legM = defaultLegMeters(turn, isUturn);
-  const scaleFactors = [1.0, 0.72, 1.5];
+  /** Expand leg length on later groups (wider suburban / grid blocks), never shrink. */
+  const scaleFactors = [1.0, 1.5, 2.0];
 
   type Candidate = { groupIdx: number; point: LatLon };
   const candidates: Candidate[] = [];
 
   for (let gi = 0; gi < scaleFactors.length; gi++) {
-    const leg = Math.max(38, Math.min(300, legM * scaleFactors[gi]!));
+    const leg = Math.max(90, Math.min(300, legM * scaleFactors[gi]!));
     const corners = buildThreeRightCorners(turn.lat, turn.lon, turn.bearingBefore, leg);
     for (const c of corners) {
       if (!tooCloseToAny(c, existingAsLatLon, minSep)) {
@@ -333,7 +335,7 @@ async function waypointsForOneTurn(
 
   for (let gi = 0; gi < scaleFactors.length; gi++) {
     const groupPoints = resolved.filter((r) => r.groupIdx === gi).map((r) => r.point);
-    if (groupPoints.length >= 2) {
+    if (groupPoints.length >= 3) {
       return { added: groupPoints, usedThreeRight: true };
     }
   }
@@ -347,9 +349,8 @@ async function waypointsForOneTurn(
 }
 
 /**
- * Produce up to three road-snapped waypoints (three-right pattern) or a single
- * legacy nudge waypoint for the Nth remaining left-like maneuver (controlled by
- * `opts.skipCount`, default 0 = first left turn).
+ * Produce up to four road-snapped jug-handle waypoints or a single nudge waypoint
+ * for the Nth remaining left-like maneuver (`opts.skipCount`, default 0).
  */
 export async function buildNextOnlyRightWaypoints(
   route: DetourRouteInput,
@@ -371,7 +372,7 @@ export type OptimizeOnlyRightOptions = {
   osrmBaseUrl: string;
   start: LatLngTuple;
   end: LatLngTuple;
-  /** Optimal baseline route (e.g. fastest from summarizeAndPickBest) to rewrite. */
+  /** Baseline route to rewrite (fastest duration among OSRM alternatives). */
   baseRoute: DetourRouteInput;
   fetchRouteViaWaypoints: (
     start: LatLngTuple,
