@@ -11,7 +11,6 @@ import {
   formatDuration,
   instructionFromOsrmStep,
   summarizeAndPickBest,
-  summarizeAndPickOnlyRightTurnsBest,
   summarizeRoutes,
   type OsrmRouteSummary,
 } from "./routing";
@@ -186,7 +185,7 @@ async function fetchRouteViaWaypoints(
   opts?: { timeoutMs?: number },
 ): Promise<OsrmRoute> {
   const viaCount = via.length;
-  const scaled = Math.min(120000, 20000 + viaCount * 5500);
+  const scaled = Math.min(50000, 15000 + viaCount * 2000);
   const budgetMs = opts?.timeoutMs !== undefined ? Math.max(opts.timeoutMs, scaled) : scaled;
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), budgetMs);
@@ -376,10 +375,16 @@ function buildApp() {
   }
 
   function getNavSteps(route: OsrmRoute): NavStep[] {
+    const legs = route.legs ?? [];
     const out: NavStep[] = [];
-    for (const leg of route.legs ?? []) {
+    for (let li = 0; li < legs.length; li++) {
+      const leg = legs[li]!;
+      const isLastLeg = li === legs.length - 1;
       for (const step of leg.steps ?? []) {
         const m = step.maneuver;
+        const type = (m?.type ?? "").toLowerCase();
+        // Intermediate via points use maneuver type "arrive" like the real destination — skip those.
+        if (type === "arrive" && !isLastLeg) continue;
         const loc = m?.location;
         if (!loc || loc.length < 2) continue;
         const lon = loc[0]!;
@@ -1069,11 +1074,8 @@ function buildApp() {
         let best: OsrmRouteSummary | null;
 
         if (onlyRightMode) {
-          const onlyRightPick = summarizeAndPickOnlyRightTurnsBest(routes);
-          summaries = onlyRightPick.summaries;
-          best = onlyRightPick.best;
-          strictOnlyRight = onlyRightPick.strict;
-          allowedIndices = onlyRightPick.allowedIndices;
+          const optimalPick = summarizeAndPickBest(routes);
+          best = optimalPick.best;
 
           if (!best) {
             hideRouteOverlay();
@@ -1081,12 +1083,10 @@ function buildApp() {
             return;
           }
 
-          // If strict “zero-left/uturn” isn't available, rewrite using three-right detours
-          // (bearing-based corners + OSRM Nearest snapping), iteratively until no lefts or no progress.
-          if (!onlyRightPick.strict && best.leftTurns > 0) {
+          if (best.leftTurns > 0) {
             setOverlayCopy(
-              "Optimizing for right turns only…",
-              "Computing detours and snapping waypoints to nearby roads (this may take a moment).",
+              "Optimizing for right turns only\u2026",
+              `Converting ${best.leftTurns} left turn${best.leftTurns === 1 ? "" : "s"} into right-turn loops (snapping to roads).`,
             );
             try {
               const optimized = await optimizeRouteOnlyRightTurns({
@@ -1095,9 +1095,18 @@ function buildApp() {
                 end: [destPlace.lat, destPlace.lon],
                 baseRoute: routes[best.index]! as DetourRouteInput,
                 fetchRouteViaWaypoints: (s, e, via, o) => fetchRouteViaWaypoints(s, e, via, o),
-                maxIterations: 14,
+                maxIterations: 12,
                 maxTotalWaypoints: 22,
                 routeTimeoutMs: 26000,
+                nearestTimeoutMs: 6000,
+                timeBudgetMs: 45000,
+                onProgress: ({ iteration, leftTurns, elapsedMs }) => {
+                  const sec = Math.round(elapsedMs / 1000);
+                  setOverlayCopy(
+                    "Optimizing for right turns only\u2026",
+                    `Pass ${iteration + 1}: ${leftTurns} left turn${leftTurns === 1 ? "" : "s"} remaining (${sec}s)`,
+                  );
+                },
               });
               routes[best.index] = optimized.route as OsrmRoute;
               summaries = summarizeRoutes(routes);
@@ -1110,6 +1119,10 @@ function buildApp() {
               strictOnlyRight = false;
               allowedIndices = [best.index];
             }
+          } else {
+            summaries = optimalPick.summaries;
+            strictOnlyRight = true;
+            allowedIndices = [best.index];
           }
         } else {
           const normalPick = summarizeAndPickBest(routes);
