@@ -1,6 +1,6 @@
 import L from "leaflet";
 
-const COLORS = ["#58a6ff", "#3fb950", "#d29922", "#a371f7", "#f778ba", "#79c0ff"] as const;
+const COLORS = ["#58a6ff", "#388bfd", "#d29922", "#a371f7", "#f778ba", "#79c0ff"] as const;
 
 function ensurePreviewPane(map: L.Map): string {
   const name = "randomPathPreview";

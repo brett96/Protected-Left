@@ -4,8 +4,8 @@
   --border: #30363d;
   --text: #e6edf3;
   --muted: #8b949e;
-  --accent: #3fb950;
-  --accent-dim: #238636;
+  --accent: #58a6ff;
+  --accent-dim: #1f6feb;
   --warn: #d29922;
   --danger: #f85149;
   --font: "Segoe UI", system-ui, -apple-system, sans-serif;
@@ -295,7 +295,7 @@ button {
   padding: 0.45rem 0.9rem;
   border-radius: 6px;
   border: 1px solid var(--accent-dim);
-  background: linear-gradient(180deg, #2ea043 0%, var(--accent-dim) 100%);
+    background: linear-gradient(180deg, #388bfd 0%, var(--accent-dim) 100%);
   color: #fff;
   cursor: pointer;
   white-space: nowrap;
@@ -565,7 +565,7 @@ button.secondary {
   padding: 0.45rem 0.75rem;
   border-radius: 10px;
   border: 1px solid var(--accent-dim);
-  background: linear-gradient(180deg, #2ea043 0%, var(--accent-dim) 100%);
+    background: linear-gradient(180deg, #388bfd 0%, var(--accent-dim) 100%);
   color: #fff;
   font-weight: 600;
   cursor: pointer;
@@ -573,6 +573,15 @@ button.secondary {
 
 .nav-toggle-btn:hover:not(:disabled) {
   filter: brightness(1.08);
+}
+
+.nav-toggle-btn--navigating {
+  border-color: #da3633;
+  background: linear-gradient(180deg, #f85149 0%, #a40e26 100%);
+}
+
+.nav-toggle-btn--navigating:hover:not(:disabled) {
+  filter: brightness(1.06);
 }
 
 .nav-option {
@@ -604,6 +613,43 @@ button.secondary {
   color: var(--text);
   font-size: 0.85rem;
   line-height: 1.35;
+}
+
+.nav-steps-wrap {
+  margin-top: 0.55rem;
+}
+
+.nav-steps-head {
+  font-size: 0.75rem;
+  margin-bottom: 0.35rem;
+}
+
+.nav-steps-list {
+  margin: 0;
+  padding-left: 1.15rem;
+  max-height: 11rem;
+  overflow-y: auto;
+  font-size: 0.8rem;
+  line-height: 1.4;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding-top: 0.35rem;
+  padding-bottom: 0.35rem;
+  padding-right: 0.35rem;
+}
+
+.nav-steps-list .nav-step {
+  margin-bottom: 0.25rem;
+  padding-left: 0.15rem;
+}
+
+.nav-steps-list .nav-step:last-child {
+  margin-bottom: 0;
+}
+
+.nav-steps-list .nav-step--active {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .toggle-option {

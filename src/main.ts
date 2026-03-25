@@ -9,6 +9,7 @@ import { startRandomPathPreview } from "./randomPathPreview";
 import {
   formatDistance,
   formatDuration,
+  instructionFromOsrmStep,
   summarizeAndPickBest,
   summarizeAndPickOnlyRightTurnsBest,
   summarizeRoutes,
@@ -16,6 +17,7 @@ import {
 } from "./routing";
 import { addressesMatch, geocodeAddress } from "./geocode";
 import { SITE_FOOTER_HTML } from "./footer";
+import { optimizeRouteOnlyRightTurns, type DetourRouteInput } from "./onlyRightDetour";
 import { type PhotonPlace, photonReverse } from "./photon";
 
 L.Icon.Default.mergeOptions({
@@ -70,10 +72,16 @@ type OsrmRoute = {
   geometry: GeoJSON.LineString | GeoJSON.MultiLineString;
   legs: Array<{
     steps: Array<{
+      name?: string;
+      ref?: string;
+      distance?: number;
       maneuver?: {
         modifier?: string;
         type?: string;
         instruction?: string;
+        exit?: number;
+        bearing_before?: number;
+        bearing_after?: number;
         /** OSRM provides [lon, lat] */
         location?: [number, number];
       };
@@ -89,6 +97,17 @@ type OsrmResponse = {
 
 function osrmBaseUrl(): string {
   return import.meta.env.DEV ? `${window.location.origin}/osrm` : "https://router.project-osrm.org";
+}
+
+function isTimeoutAbortError(e: unknown): boolean {
+  if (typeof DOMException !== "undefined" && e instanceof DOMException && e.name === "AbortError") {
+    return true;
+  }
+  if (e instanceof Error) {
+    if (e.name === "AbortError") return true;
+    if (/aborted/i.test(e.message)) return true;
+  }
+  return false;
 }
 
 async function fetchRoutes(
@@ -124,14 +143,18 @@ async function fetchRoutes(
   }
 
   try {
-    return await attempt(true, 12000);
+    // Public OSRM can be slow with alternatives=true; short timeouts caused spurious aborts.
+    return await attempt(true, 30000);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const m = msg.match(/\((\d+)\)/);
     const status = m ? parseInt(m[1]!, 10) : NaN;
-    // Retry once with fewer alternatives when OSRM is under stress/timeouts.
+    // Retry with fewer alternatives when OSRM is under stress or the request timed out.
     if (Number.isFinite(status) && (status === 502 || status === 503 || status === 504)) {
-      return await attempt(false, 9000);
+      return await attempt(false, 25000);
+    }
+    if (isTimeoutAbortError(e)) {
+      return await attempt(false, 25000);
     }
     throw e;
   }
@@ -144,7 +167,7 @@ async function fetchRouteViaWaypoints(
   opts?: { timeoutMs?: number },
 ): Promise<OsrmRoute> {
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), opts?.timeoutMs ?? 12000);
+  const timeoutId = window.setTimeout(() => controller.abort(), opts?.timeoutMs ?? 20000);
 
   const coords = [[start, ...via, end]]
     .flat()
@@ -331,29 +354,44 @@ function buildApp() {
   }
 
   function getNavSteps(route: OsrmRoute): NavStep[] {
-    // OSRM route legs is normally a single leg for driving, but keep the structure flexible.
-    const allSteps: Array<{ maneuver?: any }> = [];
-    for (const leg of route.legs ?? []) {
-      for (const s of leg.steps ?? []) allSteps.push(s);
-    }
-
     const out: NavStep[] = [];
-    for (let i = 0; i < allSteps.length; i++) {
-      const m = allSteps[i]!.maneuver;
-      const loc = m?.location;
-      const instruction = (m?.instruction ?? "").trim();
-      if (!loc || !instruction) continue;
-      const lon = loc[0];
-      const lat = loc[1];
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
-      out.push({ index: out.length, latlng: [lat, lon], instruction });
+    for (const leg of route.legs ?? []) {
+      for (const step of leg.steps ?? []) {
+        const m = step.maneuver;
+        const loc = m?.location;
+        if (!loc || loc.length < 2) continue;
+        const lon = loc[0]!;
+        const lat = loc[1]!;
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        const instruction = instructionFromOsrmStep(step).trim();
+        if (!instruction) continue;
+        out.push({ index: out.length, latlng: [lat, lon], instruction });
+      }
     }
     return out;
+  }
+
+  function escapeHtml(s: string): string {
+    return s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  function updateNavStepHighlight(activeIdx: number | null) {
+    const root = document.getElementById("nav-steps-list");
+    if (!root) return;
+    root.querySelectorAll("[data-nav-step]").forEach((el, i) => {
+      el.classList.toggle("nav-step--active", activeIdx !== null && i === activeIdx);
+    });
   }
 
   function speak(text: string) {
     if (!text) return;
     if (!("speechSynthesis" in window)) return;
+    // Ensures voices load in Chromium (otherwise speak can be silent).
+    void window.speechSynthesis.getVoices();
     if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
       window.speechSynthesis.cancel();
     }
@@ -391,6 +429,7 @@ function buildApp() {
     userAccuracyCircle?.remove();
     userAccuracyCircle = null;
     setNavLiveText("", "");
+    updateNavStepHighlight(null);
   }
 
   function startNavigationForActiveRoute() {
@@ -400,6 +439,7 @@ function buildApp() {
     if (steps.length === 0) {
       stopNavigation();
       setStatus("No turn-by-turn steps available for speech/navigation.", true);
+      renderRouteAlternativesPanel();
       return;
     }
 
@@ -426,12 +466,14 @@ function buildApp() {
       watchId: -1,
       activeStepIndex: 0,
       spokenUpcoming,
-      lastRealtimeSpokenStepIndex: null,
+      lastRealtimeSpokenStepIndex: 0,
       steps,
     };
 
     setPanelCollapsed(false);
     setStatus("Navigation started…", false);
+    speak(steps[0]!.instruction);
+    updateNavStepHighlight(0);
 
     const realtimeThresholdM = 85;
     const upcomingThresholdM = 240;
@@ -506,6 +548,7 @@ function buildApp() {
           }
 
           setNavLiveText(nextStep.instruction, currentStep.instruction);
+          updateNavStepHighlight(navigationSession.activeStepIndex);
 
           // Follow the user lightly so the blue dot remains visible.
           map.panTo(ll, { animate: true, duration: 0.25 });
@@ -518,9 +561,12 @@ function buildApp() {
             ? "Navigation needs location permission."
             : "Could not start navigation (location unavailable).",
         );
+        renderRouteAlternativesPanel();
       },
       opts,
     );
+
+    renderRouteAlternativesPanel();
   }
 
   const overlayEl = root.querySelector<HTMLDivElement>("#route-loading-overlay")!;
@@ -714,6 +760,23 @@ function buildApp() {
 
     const others = summaries.filter((s) => s.index !== activeIndex && allowedSet.has(s.index));
 
+    const routeForSteps = sess.routes[sess.activeIndex];
+    const navSteps = routeForSteps ? getNavSteps(routeForSteps) : [];
+    const stepsBlock =
+      navSteps.length > 0
+        ? `<div class="nav-steps-wrap">
+        <div class="nav-steps-head muted">Turn-by-turn</div>
+        <ol class="nav-steps-list" id="nav-steps-list" start="1">
+          ${navSteps
+            .map(
+              (_st, i) =>
+                `<li data-nav-step="${i}" class="nav-step">${escapeHtml(_st.instruction)}</li>`,
+            )
+            .join("")}
+        </ol>
+      </div>`
+        : `<div class="muted">Turn-by-turn steps could not be built from this route.</div>`;
+
     const othersBlock =
       others.length > 0
         ? `<div class="route-alternatives">
@@ -747,9 +810,11 @@ function buildApp() {
           ${formatDistance(current.distanceM)}
         </div>
 
+        ${stepsBlock}
+
         <div class="nav-actions">
-          <button type="button" class="nav-toggle-btn" id="nav-toggle-btn" aria-pressed="${navActive ? "true" : "false"}">
-            ${navActive ? "Stop" : "Navigate"}
+          <button type="button" class="nav-toggle-btn${navActive ? " nav-toggle-btn--navigating" : ""}" id="nav-toggle-btn" aria-pressed="${navActive ? "true" : "false"}" aria-label="${navActive ? "End navigation" : "Start navigation"}">
+            ${navActive ? "End Navigation" : "Navigate"}
           </button>
           <label class="nav-option">
             <input type="checkbox" data-nav-opt="upcoming" ${navSpeakUpcoming ? "checked" : ""} />
@@ -783,7 +848,7 @@ function buildApp() {
     const chosen = sess.routes[newIndex]!;
     const latlngs = routeToLatLngs(chosen);
     finalRouteLayer = L.polyline(latlngs, {
-      color: "#3fb950",
+      color: "#58a6ff",
       weight: 7,
       opacity: 0.95,
       lineCap: "round",
@@ -812,8 +877,10 @@ function buildApp() {
     const navBtn = (e.target as HTMLElement).closest("button.nav-toggle-btn");
     if (!navBtn) return;
     const navActive = navigationSession !== null;
-    if (navActive) stopNavigation();
-    else startNavigationForActiveRoute();
+    if (navActive) {
+      stopNavigation();
+      renderRouteAlternativesPanel();
+    } else startNavigationForActiveRoute();
   });
 
   statsEl.addEventListener("change", (e) => {
@@ -992,117 +1059,34 @@ function buildApp() {
             return;
           }
 
-          // If strict “zero-left/uturn” isn't available, try one best-effort rewrite via detour waypoints.
-          if (!onlyRightPick.strict && best.leftTurns > 0 && best.leftTurns <= 2) {
-            const baseRoute = routes[best.index]!;
-
-            // Collect step points with locations so we can infer a local heading.
-            const stepPoints: Array<{ latlng: L.LatLngTuple; isLeft: boolean }> = [];
-            for (const leg of baseRoute.legs ?? []) {
-              for (const step of leg.steps ?? []) {
-                const m = step.maneuver;
-                const loc = m?.location;
-                if (!loc) continue;
-                const mod = m?.modifier?.toLowerCase() ?? "";
-                const isLeft =
-                  mod.includes("uturn") || mod.includes("left") || mod === "uturn";
-                if (!mod.includes("left") && !mod.includes("uturn") && !isLeft) {
-                  // keep normal points; isLeft indicates left-only candidates for waypoints.
-                }
-                stepPoints.push({
-                  latlng: [loc[1], loc[0]],
-                  isLeft: isLeft,
-                });
-              }
-            }
-
-            const leftIndices = stepPoints
-              .map((p, i) => (p.isLeft ? i : -1))
-              .filter((i) => i !== -1) as number[];
-
-            const MAX_WAYPOINTS = 2;
-            const RIGHT_OFFSET_M = 55;
-            const FORWARD_OFFSET_M = 15;
-
-            function buildWaypointForPoint(pointIndex: number): L.LatLngTuple | null {
-              const here = stepPoints[pointIndex];
-              const prev = stepPoints[pointIndex - 1];
-              const next = stepPoints[pointIndex + 1];
-              if (!prev || !next || !here) return null;
-
-              const dxLon = next.latlng[1] - prev.latlng[1];
-              const dyLat = next.latlng[0] - prev.latlng[0];
-              const len = Math.hypot(dxLon, dyLat);
-              if (!len || !Number.isFinite(len)) return null;
-
-              // Heading unit in (lon, lat).
-              const unitLon = dxLon / len;
-              const unitLat = dyLat / len;
-
-              // Right-hand perpendicular (clockwise in lon/lat plane): (dy, -dx) => (rightLon, rightLat)
-              const rightLonUnit = dyLat / len;
-              const rightLatUnit = -dxLon / len;
-
-              const latRad = (here.latlng[0] * Math.PI) / 180;
-              const metersPerDegLat = 111320;
-              const metersPerDegLon = 111320 * Math.cos(latRad) || 1;
-
-              const rightLatDeg = (rightLatUnit * RIGHT_OFFSET_M) / metersPerDegLat;
-              const rightLonDeg = (rightLonUnit * RIGHT_OFFSET_M) / metersPerDegLon;
-
-              const fwdLatDeg = (unitLat * FORWARD_OFFSET_M) / metersPerDegLat;
-              const fwdLonDeg = (unitLon * FORWARD_OFFSET_M) / metersPerDegLon;
-
-              return [
-                here.latlng[0] + rightLatDeg + fwdLatDeg,
-                here.latlng[1] + rightLonDeg + fwdLonDeg,
-              ];
-            }
-
-            const waypoints: L.LatLngTuple[] = [];
-            for (const idx of leftIndices.slice(0, MAX_WAYPOINTS * 2)) {
-              const wp = buildWaypointForPoint(idx);
-              if (!wp) continue;
-              const tooClose = waypoints.some((p) => haversineMeters(p, wp) < 40);
-              if (tooClose) continue;
-              waypoints.push(wp);
-              if (waypoints.length >= MAX_WAYPOINTS) break;
-            }
-
-            if (waypoints.length > 0) {
-              try {
-                const modified = await fetchRouteViaWaypoints(
-                  [startPlace.lat, startPlace.lon],
-                  [destPlace.lat, destPlace.lon],
-                  waypoints,
-                  { timeoutMs: 8000 },
-                );
-
-                const modSummary = summarizeRoutes([modified])[0]!;
-                // Accept if it reduces left turns, or if it ties but is faster.
-                const baseLeft = best.leftTurns;
-                const baseDuration = best.durationSec;
-                const improved =
-                  modSummary.leftTurns < baseLeft ||
-                  (modSummary.leftTurns === baseLeft && modSummary.durationSec <= baseDuration);
-
-                if (improved) {
-                  routes[best.index] = modified;
-                  summaries = summarizeRoutes(routes);
-                  strictOnlyRight = modSummary.leftTurns === 0;
-                  allowedIndices = [best.index];
-                } else {
-                  allowedIndices = [best.index];
-                  strictOnlyRight = false;
-                }
-              } catch {
-                // If rewrite fails (including 504), fall back to best available.
-                allowedIndices = [best.index];
-                strictOnlyRight = false;
-              }
-            } else {
-              allowedIndices = [best.index];
+          // If strict “zero-left/uturn” isn't available, rewrite using three-right detours
+          // (bearing-based corners + OSRM Nearest snapping), iteratively until no lefts or no progress.
+          if (!onlyRightPick.strict && best.leftTurns > 0) {
+            setOverlayCopy(
+              "Optimizing for right turns only…",
+              "Computing detours and snapping waypoints to nearby roads (this may take a moment).",
+            );
+            try {
+              const optimized = await optimizeRouteOnlyRightTurns({
+                osrmBaseUrl: osrmBaseUrl(),
+                start: [startPlace.lat, startPlace.lon],
+                end: [destPlace.lat, destPlace.lon],
+                baseRoute: routes[best.index]! as DetourRouteInput,
+                fetchRouteViaWaypoints: (s, e, via, o) => fetchRouteViaWaypoints(s, e, via, o),
+                maxIterations: 14,
+                maxTotalWaypoints: 22,
+                routeTimeoutMs: 26000,
+              });
+              routes[best.index] = optimized.route as OsrmRoute;
+              summaries = summarizeRoutes(routes);
+              strictOnlyRight = optimized.strict;
+              allowedIndices = strictOnlyRight
+                ? summaries.filter((s) => s.leftTurns === 0).map((s) => s.index)
+                : [best.index];
+            } catch {
+              summaries = summarizeRoutes(routes);
               strictOnlyRight = false;
+              allowedIndices = [best.index];
             }
           }
         } else {
@@ -1142,7 +1126,7 @@ function buildApp() {
         const latlngs = routeLatlngsList[best.index]!;
 
         finalRouteLayer = L.polyline(latlngs, {
-          color: "#3fb950",
+          color: "#58a6ff",
           weight: 7,
           opacity: 0.95,
           lineCap: "round",
