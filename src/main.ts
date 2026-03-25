@@ -174,15 +174,18 @@ function buildApp() {
         </div>
       </div>
       <div class="panel" id="panel">
-        <p class="muted">
-          Type a full street address and tap <strong>Route</strong>.  If an address isn't found, enter a nearby location, and the dropped pin can be dragged and dropped to the correct location. The app compares driving routes from <a href="https://project-osrm.org/" target="_blank" rel="noopener">OSRM</a> and picks the one with the
-          <strong>fewest left turns</strong>. This is an approximation, not a guarantee of protected left signals.
-        </p>
-        <div id="status-row" class="status-row" role="status" aria-live="polite">
-          <span class="route-spinner" aria-hidden="true"></span>
-          <p id="status" class="status-bar"></p>
+        <button type="button" class="panel-collapse-btn" id="panel-collapse-btn" aria-expanded="true" aria-controls="panel-inner" aria-label="Minimize route info">−</button>
+        <div class="panel-inner" id="panel-inner">
+          <p class="muted">
+            Type a full street address and tap <strong>Route</strong>.  If an address isn't found, enter a nearby location, and the dropped pin can be dragged and dropped to the correct location. The app compares driving routes from <a href="https://project-osrm.org/" target="_blank" rel="noopener">OSRM</a> and picks the one with the
+            <strong>fewest left turns</strong>. This is an approximation, not a guarantee of protected left signals.
+          </p>
+          <div id="status-row" class="status-row" role="status" aria-live="polite">
+            <span class="route-spinner" aria-hidden="true"></span>
+            <p id="status" class="status-bar"></p>
+          </div>
+          <div id="stats" class="stats"></div>
         </div>
-        <div id="stats" class="stats"></div>
       </div>
     </div>
     ${SITE_FOOTER_HTML}
@@ -209,12 +212,23 @@ function buildApp() {
   let finalRouteLayer: L.Polyline | null = null;
   let analysisPolylines: L.Polyline[] = [];
 
+  type RouteAlternativesSession = {
+    routes: OsrmRoute[];
+    summaries: OsrmRouteSummary[];
+    activeIndex: number;
+    /** Index OSRM chose for fewest left turns (for “suggested” note). */
+    bestIndex: number;
+  };
+  let routeAlternativesSession: RouteAlternativesSession | null = null;
+
   const overlayEl = root.querySelector<HTMLDivElement>("#route-loading-overlay")!;
   const overlayTitleEl = root.querySelector<HTMLParagraphElement>("#overlay-title")!;
   const overlaySubEl = root.querySelector<HTMLParagraphElement>("#overlay-sub")!;
   const statusRowEl = root.querySelector<HTMLDivElement>("#status-row")!;
   const statusEl = root.querySelector<HTMLParagraphElement>("#status")!;
   const statsEl = root.querySelector<HTMLDivElement>("#stats")!;
+  const panelEl = root.querySelector<HTMLDivElement>("#panel")!;
+  const panelCollapseBtn = root.querySelector<HTMLButtonElement>("#panel-collapse-btn")!;
   const startInput = root.querySelector<HTMLInputElement>("#start")!;
   const destInput = root.querySelector<HTMLInputElement>("#dest")!;
   const goBtn = root.querySelector<HTMLButtonElement>("#go")!;
@@ -355,13 +369,104 @@ function buildApp() {
     analysisPolylines = [];
   }
 
+  function setPanelCollapsed(collapsed: boolean) {
+    panelEl.classList.toggle("panel--collapsed", collapsed);
+    panelCollapseBtn.textContent = collapsed ? "+" : "−";
+    panelCollapseBtn.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    panelCollapseBtn.setAttribute("aria-label", collapsed ? "Show route info" : "Minimize route info");
+  }
+
   /** Clears computed route geometry and summary only; keeps start/destination pins. */
   function clearRoutePaths() {
+    routeAlternativesSession = null;
     finalRouteLayer?.remove();
     finalRouteLayer = null;
     clearAnalysisLayers();
     statsEl.innerHTML = "";
+    setPanelCollapsed(false);
   }
+
+  function renderRouteAlternativesPanel() {
+    const sess = routeAlternativesSession;
+    if (!sess) {
+      statsEl.innerHTML = "";
+      return;
+    }
+    const { summaries, activeIndex, bestIndex } = sess;
+    const current = summaries.find((s) => s.index === activeIndex);
+    if (!current) return;
+
+    const suggestedNote =
+      activeIndex === bestIndex
+        ? `<div class="route-picked-note">Suggested: fewest left turns among these options</div>`
+        : "";
+
+    const others = summaries.filter((s) => s.index !== activeIndex);
+
+    const othersBlock =
+      others.length > 0
+        ? `<div class="route-alternatives">
+            <span class="route-alternatives-label muted">Other options — tap to show on map</span>
+            <ul class="route-alt-list" role="list">
+              ${others
+                .map(
+                  (s) => `<li>
+                <button type="button" class="route-alt-btn" data-route-index="${s.index}">
+                  <span class="route-alt-title">Option ${s.index + 1}</span>
+                  <span class="route-alt-meta">${s.leftTurns} left turn${s.leftTurns === 1 ? "" : "s"} · ${formatDuration(s.durationSec)} · ${formatDistance(s.distanceM)}</span>
+                </button>
+              </li>`,
+                )
+                .join("")}
+            </ul>
+          </div>`
+        : `<div class="muted">Only one route was returned for this trip.</div>`;
+
+    statsEl.innerHTML = `
+      <div class="route-displayed">
+        <strong>Route on map</strong> · Option ${activeIndex + 1}
+        ${suggestedNote}
+        <div class="route-displayed-stats">
+          ${current.leftTurns} left turn${current.leftTurns === 1 ? "" : "s"} ·
+          ${formatDuration(current.durationSec)} ·
+          ${formatDistance(current.distanceM)}
+        </div>
+      </div>
+      ${othersBlock}
+    `;
+  }
+
+  function switchActiveRoute(newIndex: number) {
+    const sess = routeAlternativesSession;
+    if (!sess || newIndex === sess.activeIndex) return;
+    if (newIndex < 0 || newIndex >= sess.routes.length) return;
+
+    sess.activeIndex = newIndex;
+    finalRouteLayer?.remove();
+    const chosen = sess.routes[newIndex]!;
+    const latlngs = routeToLatLngs(chosen);
+    finalRouteLayer = L.polyline(latlngs, {
+      color: "#3fb950",
+      weight: 7,
+      opacity: 0.95,
+      lineCap: "round",
+      lineJoin: "round",
+    }).addTo(map);
+
+    map.fitBounds(L.latLngBounds(latlngs), { padding: [56, 56], maxZoom: 15 });
+    renderRouteAlternativesPanel();
+  }
+
+  panelCollapseBtn.addEventListener("click", () => {
+    setPanelCollapsed(!panelEl.classList.contains("panel--collapsed"));
+  });
+
+  statsEl.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest("button.route-alt-btn");
+    if (!btn) return;
+    const idx = parseInt(btn.getAttribute("data-route-index") ?? "", 10);
+    if (!Number.isNaN(idx)) switchActiveRoute(idx);
+  });
 
   function setRoutingBusy(busy: boolean) {
     goBtn.disabled = busy;
@@ -520,6 +625,13 @@ function buildApp() {
       clearAnalysisLayers();
       hideRouteOverlay();
 
+      routeAlternativesSession = {
+        routes,
+        summaries,
+        activeIndex: best.index,
+        bestIndex: best.index,
+      };
+
       const chosen = routes[best.index]!;
       const latlngs = routeToLatLngs(chosen);
       finalRouteLayer = L.polyline(latlngs, {
@@ -532,28 +644,8 @@ function buildApp() {
 
       map.fitBounds(L.latLngBounds(latlngs), { padding: [56, 56], maxZoom: 15 });
 
-      const others = summaries
-        .filter((s) => s.index !== best.index)
-        .map(
-          (s) =>
-            `Option ${s.index + 1}: ${s.leftTurns} left turns, ${formatDuration(s.durationSec)}`,
-        )
-        .join(" · ");
-
       setStatus("");
-      statsEl.innerHTML = `
-      <div>
-        <strong>Chosen route</strong><br />
-        ${best.leftTurns} left turn${best.leftTurns === 1 ? "" : "s"} ·
-        ${formatDuration(best.durationSec)} ·
-        ${formatDistance(best.distanceM)}
-      </div>
-      ${
-        others
-          ? `<div class="muted">Other options: ${others}</div>`
-          : '<div class="muted">Only one route was returned for this trip.</div>'
-      }
-    `;
+      renderRouteAlternativesPanel();
     } catch (e) {
       hideRouteOverlay();
       clearAnalysisLayers();
