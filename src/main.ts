@@ -146,14 +146,14 @@ function buildApp() {
           <div class="field-wrap">
             <label for="start">Starting point</label>
             <div class="input-with-suggestions">
-              <input type="text" id="start" placeholder="Type any address (suggestions optional)" autocomplete="off" spellcheck="false" />
+              <input type="text" id="start" placeholder="Type any address (suggestions optional)" autocomplete="off" spellcheck="false" enterkeyhint="search" inputmode="text" />
               <ul id="start-list" class="autocomplete-list" hidden></ul>
             </div>
           </div>
           <div class="field-wrap">
             <label for="dest">Destination</label>
             <div class="input-with-suggestions">
-              <input type="text" id="dest" placeholder="Type any address (suggestions optional)" autocomplete="off" spellcheck="false" />
+              <input type="text" id="dest" placeholder="Type any address (suggestions optional)" autocomplete="off" spellcheck="false" enterkeyhint="go" inputmode="text" />
               <ul id="dest-list" class="autocomplete-list" hidden></ul>
             </div>
           </div>

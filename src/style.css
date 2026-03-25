@@ -17,6 +17,10 @@
   box-sizing: border-box;
 }
 
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
 html,
 body {
   margin: 0;
@@ -34,6 +38,13 @@ body {
   min-height: 100vh;
 }
 
+@supports (height: 100dvh) {
+  #app {
+    height: 100dvh;
+    min-height: 100dvh;
+  }
+}
+
 #page-root {
   min-height: 100vh;
   display: flex;
@@ -42,7 +53,8 @@ body {
 
 .site-footer {
   flex-shrink: 0;
-  padding: 0.75rem 1rem;
+  padding: 0.75rem max(1rem, env(safe-area-inset-left)) max(0.75rem, env(safe-area-inset-bottom))
+    max(1rem, env(safe-area-inset-right));
   border-top: 1px solid var(--border);
   background: var(--surface);
   text-align: center;
@@ -81,7 +93,8 @@ body {
 
 .legal-top {
   flex-shrink: 0;
-  padding: 0.75rem 1rem;
+  padding: max(0.75rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right)) 0.75rem
+    max(1rem, env(safe-area-inset-left));
   border-bottom: 1px solid var(--border);
   background: var(--surface);
 }
@@ -100,7 +113,8 @@ body {
   flex: 1;
   max-width: 42rem;
   margin: 0 auto;
-  padding: 1.5rem 1rem 2.5rem;
+  padding: 1.5rem max(1rem, env(safe-area-inset-left)) max(2.5rem, env(safe-area-inset-bottom))
+    max(1rem, env(safe-area-inset-right));
   width: 100%;
 }
 
@@ -156,7 +170,8 @@ body {
 
 .app-header {
   flex-shrink: 0;
-  padding: 0.75rem 1rem;
+  padding: max(0.75rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right)) 0.75rem
+    max(1rem, env(safe-area-inset-left));
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   display: flex;
@@ -396,10 +411,11 @@ button.secondary {
 
 .panel {
   position: absolute;
-  bottom: 1rem;
-  left: 1rem;
-  right: 1rem;
+  bottom: max(1rem, env(safe-area-inset-bottom));
+  left: max(1rem, env(safe-area-inset-left));
+  right: max(1rem, env(safe-area-inset-right));
   max-width: 28rem;
+  margin: 0 auto;
   z-index: 1000;
   background: rgba(22, 27, 34, 0.94);
   border: 1px solid var(--border);
@@ -499,14 +515,148 @@ button.secondary {
   color: var(--accent) !important;
 }
 
-@media (max-width: 640px) {
+@media (max-width: 768px) {
+  .brand {
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 0.2rem;
+    width: 100%;
+  }
+
   .brand h1 {
-    font-size: 1.1rem;
+    font-size: 1.15rem;
+  }
+
+  .brand span {
+    font-size: 0.72rem;
+  }
+
+  .app-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.65rem;
+  }
+
+  .controls {
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+    gap: 0.5rem;
+  }
+
+  .controls-fields {
+    flex-direction: column;
+    width: 100%;
+    gap: 0.65rem;
   }
 
   .field-wrap {
     max-width: none;
     min-width: 0;
     width: 100%;
+  }
+
+  .field-wrap label {
+    font-size: 0.82rem;
+  }
+
+  /* 16px+ prevents iOS Safari from zooming inputs on focus */
+  .field-wrap input[type="text"] {
+    font-size: 16px;
+    padding: 0.65rem 0.75rem;
+    min-height: 44px;
+  }
+
+  .controls-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.5rem;
+    width: 100%;
+  }
+
+  button {
+    min-height: 44px;
+    padding: 0.55rem 0.65rem;
+    font-size: 0.9rem;
+    width: 100%;
+    white-space: normal;
+    line-height: 1.25;
+  }
+
+  .autocomplete-list {
+    max-height: min(42vh, 300px);
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .autocomplete-item {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.9rem;
+  }
+
+  .panel {
+    left: max(0.65rem, env(safe-area-inset-left));
+    right: max(0.65rem, env(safe-area-inset-right));
+    bottom: max(0.65rem, env(safe-area-inset-bottom));
+    max-width: none;
+    max-height: min(40vh, 320px);
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 0.75rem 0.85rem;
+  }
+
+  .panel .muted {
+    font-size: 0.78rem;
+    line-height: 1.4;
+  }
+
+  .route-loading-overlay {
+    padding: max(1rem, env(safe-area-inset-top)) max(1rem, env(safe-area-inset-right))
+      max(1rem, env(safe-area-inset-bottom)) max(1rem, env(safe-area-inset-left));
+  }
+
+  .route-loading-card {
+    padding: 1.5rem 1.15rem;
+    max-width: min(22rem, calc(100vw - 1.5rem));
+  }
+
+  .route-loading-title {
+    font-size: 1rem;
+  }
+
+  .leaflet-top.leaflet-left .leaflet-control {
+    margin-top: max(6px, env(safe-area-inset-top)) !important;
+    margin-left: max(6px, env(safe-area-inset-left)) !important;
+  }
+
+  .leaflet-bottom.leaflet-right .leaflet-control-attribution {
+    margin-right: max(6px, env(safe-area-inset-right)) !important;
+    margin-bottom: max(4px, env(safe-area-inset-bottom)) !important;
+    max-width: min(200px, 45vw);
+    font-size: 9px;
+    line-height: 1.2;
+    white-space: normal;
+    word-break: break-word;
+  }
+
+  .legal-main h1 {
+    font-size: 1.35rem;
+  }
+
+  .legal-back {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    padding: 0.25rem 0;
+  }
+}
+
+/* Narrow phones: stack primary actions for easier thumbs */
+@media (max-width: 380px) {
+  .controls-actions {
+    grid-template-columns: 1fr;
   }
 }
