@@ -177,9 +177,18 @@ export async function snapLatLonToRoad(
   lat: number,
   lon: number,
   init?: RequestInit,
+  /** Per-request budget; each snap is independent (do not share one AbortSignal across many snaps). */
+  timeoutMs = 22000,
 ): Promise<{ lat: number; lon: number; snapM: number } | null> {
   const url = `${osrmBaseUrl}/nearest/v1/driving/${lon},${lat}?number=1`;
-  const res = await fetch(url, init);
+  const controller = new AbortController();
+  const tid = window.setTimeout(() => controller.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(tid);
+  }
   if (!res.ok) return null;
   const data = (await res.json()) as NearestResponse;
   if (data.code !== "Ok" || !data.waypoints?.[0]?.location) return null;
@@ -215,11 +224,13 @@ export async function buildNextOnlyRightWaypoints(
   opts?: {
     minSeparationM?: number;
     maxSnapM?: number;
-    fetchInit?: RequestInit;
+    /** Timeout for each OSRM /nearest request (sequential snaps each get their own timer). */
+    nearestTimeoutMs?: number;
   },
 ): Promise<{ added: LatLon[]; usedThreeRight: boolean } | null> {
   const minSep = opts?.minSeparationM ?? 36;
   const maxSnap = opts?.maxSnapM ?? 180;
+  const snapTimeout = opts?.nearestTimeoutMs ?? 22000;
 
   const flat = flattenDetourSteps(route);
   const leftIdx = flat.findIndex(
@@ -252,7 +263,7 @@ export async function buildNextOnlyRightWaypoints(
     const added: LatLon[] = [];
     for (const p of raw) {
       if (tooCloseToAny(p, existingAsLatLon, minSep)) continue;
-      const snap = await snapLatLonToRoad(osrmBaseUrl, p.lat, p.lon, opts?.fetchInit);
+      const snap = await snapLatLonToRoad(osrmBaseUrl, p.lat, p.lon, undefined, snapTimeout);
       if (!snap || snap.snapM > maxSnap) {
         added.push(p);
       } else {
@@ -270,7 +281,7 @@ export async function buildNextOnlyRightWaypoints(
     if (tooCloseToAny(c, existingAsLatLon, minSep)) {
       continue;
     }
-    const snap = await snapLatLonToRoad(osrmBaseUrl, c.lat, c.lon, opts?.fetchInit);
+    const snap = await snapLatLonToRoad(osrmBaseUrl, c.lat, c.lon, undefined, snapTimeout);
     if (!snap || snap.snapM > maxSnap) {
       added.push(c);
     } else {
@@ -292,7 +303,7 @@ export async function buildNextOnlyRightWaypoints(
     const key = `${c.lat.toFixed(5)},${c.lon.toFixed(5)}`;
     if (seen.has(key)) continue;
     if (tooCloseToAny(c, existingAsLatLon, minSep * 0.85)) continue;
-    const snap = await snapLatLonToRoad(osrmBaseUrl, c.lat, c.lon, opts?.fetchInit);
+    const snap = await snapLatLonToRoad(osrmBaseUrl, c.lat, c.lon, undefined, snapTimeout);
     const p =
       snap && snap.snapM <= maxSnap ? { lat: snap.lat, lon: snap.lon } : { ...c };
     retry.push(p);
@@ -308,7 +319,7 @@ export async function buildNextOnlyRightWaypoints(
   const single: LatLon[] = [];
   for (const p of raw) {
     if (tooCloseToAny(p, existingAsLatLon, minSep)) continue;
-    const snap = await snapLatLonToRoad(osrmBaseUrl, p.lat, p.lon, opts?.fetchInit);
+    const snap = await snapLatLonToRoad(osrmBaseUrl, p.lat, p.lon, undefined, snapTimeout);
     single.push(snap && snap.snapM <= maxSnap ? { lat: snap.lat, lon: snap.lon } : p);
   }
   return single.length ? { added: single, usedThreeRight: false } : null;
@@ -328,14 +339,11 @@ export type OptimizeOnlyRightOptions = {
   ) => Promise<DetourRouteInput>;
   maxIterations?: number;
   maxTotalWaypoints?: number;
+  /** Minimum time budget for OSRM /route with intermediate waypoints (see main.ts scaling). */
   routeTimeoutMs?: number;
+  /** Per /nearest snap call; each snap uses its own timer. */
+  nearestTimeoutMs?: number;
 };
-
-function abortAfterMs(ms: number): AbortSignal {
-  const c = new AbortController();
-  window.setTimeout(() => c.abort(), ms);
-  return c.signal;
-}
 
 /**
  * Iteratively inserts three-right (and snapped) waypoints for each remaining left
@@ -353,6 +361,7 @@ export async function optimizeRouteOnlyRightTurns(
     maxIterations = 14,
     maxTotalWaypoints = 22,
     routeTimeoutMs = 24000,
+    nearestTimeoutMs = 22000,
   } = options;
 
   let workingRoute: DetourRouteInput = baseRoute;
@@ -364,9 +373,14 @@ export async function optimizeRouteOnlyRightTurns(
       return { route: workingRoute, waypoints, strict: true };
     }
 
-    const chunk = await buildNextOnlyRightWaypoints(workingRoute, osrmBaseUrl, waypoints, {
-      fetchInit: { signal: abortAfterMs(12000) },
-    });
+    let chunk: Awaited<ReturnType<typeof buildNextOnlyRightWaypoints>>;
+    try {
+      chunk = await buildNextOnlyRightWaypoints(workingRoute, osrmBaseUrl, waypoints, {
+        nearestTimeoutMs,
+      });
+    } catch {
+      break;
+    }
     if (!chunk || chunk.added.length === 0) break;
 
     const candidateWps: LatLngTuple[] = [

@@ -110,6 +110,29 @@ function isTimeoutAbortError(e: unknown): boolean {
   return false;
 }
 
+function parseHttpStatusFromRoutingError(e: unknown): number | null {
+  if (!(e instanceof Error)) return null;
+  const m = e.message.match(/\((\d+)\)/);
+  if (!m) return null;
+  const n = parseInt(m[1]!, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Timeouts, 502/503/504 — worth retrying with simpler / longer requests. */
+function isRetryableOsrmFailure(e: unknown): boolean {
+  if (isTimeoutAbortError(e)) return true;
+  const s = parseHttpStatusFromRoutingError(e);
+  return s !== null && (s === 502 || s === 503 || s === 504);
+}
+
+function formatRoutingFailureMessage(e: unknown): string {
+  if (isTimeoutAbortError(e)) {
+    return "The routing service took too long to respond. Try again in a moment.";
+  }
+  if (e instanceof Error) return e.message;
+  return "Routing failed.";
+}
+
 async function fetchRoutes(
   fromLon: number,
   fromLat: number,
@@ -143,20 +166,16 @@ async function fetchRoutes(
   }
 
   try {
-    // Public OSRM can be slow with alternatives=true; short timeouts caused spurious aborts.
-    return await attempt(true, 30000);
+    // Public OSRM can be slow with alternatives=true; generous first attempt, then simplify + extend.
+    return await attempt(true, 60000);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    const m = msg.match(/\((\d+)\)/);
-    const status = m ? parseInt(m[1]!, 10) : NaN;
-    // Retry with fewer alternatives when OSRM is under stress or the request timed out.
-    if (Number.isFinite(status) && (status === 502 || status === 503 || status === 504)) {
-      return await attempt(false, 25000);
+    if (!isRetryableOsrmFailure(e)) throw e;
+    try {
+      return await attempt(false, 50000);
+    } catch (e2) {
+      if (!isRetryableOsrmFailure(e2)) throw e2;
+      return await attempt(false, 90000);
     }
-    if (isTimeoutAbortError(e)) {
-      return await attempt(false, 25000);
-    }
-    throw e;
   }
 }
 
@@ -166,8 +185,11 @@ async function fetchRouteViaWaypoints(
   via: L.LatLngTuple[],
   opts?: { timeoutMs?: number },
 ): Promise<OsrmRoute> {
+  const viaCount = via.length;
+  const scaled = Math.min(120000, 20000 + viaCount * 5500);
+  const budgetMs = opts?.timeoutMs !== undefined ? Math.max(opts.timeoutMs, scaled) : scaled;
   const controller = new AbortController();
-  const timeoutId = window.setTimeout(() => controller.abort(), opts?.timeoutMs ?? 20000);
+  const timeoutId = window.setTimeout(() => controller.abort(), budgetMs);
 
   const coords = [[start, ...via, end]]
     .flat()
@@ -1140,7 +1162,7 @@ function buildApp() {
         return;
       } catch (e) {
         hideRouteOverlay();
-        setStatus(e instanceof Error ? e.message : "Routing failed.");
+        setStatus(formatRoutingFailureMessage(e));
         return;
       } finally {
         stopRandomPreview?.();
@@ -1148,7 +1170,7 @@ function buildApp() {
     } catch (e) {
       hideRouteOverlay();
       clearAnalysisLayers();
-      setStatus(e instanceof Error ? e.message : "Routing failed.");
+      setStatus(formatRoutingFailureMessage(e));
     } finally {
       setRoutingBusy(false);
     }

@@ -23,6 +23,8 @@ export default defineConfig({
         target: "https://router.project-osrm.org",
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/osrm/, ""),
+        // Match long client-side OSRM timeouts during dev (avoid proxy closing first).
+        timeout: 120000,
       },
       "/nominatim": {
         target: "https://nominatim.openstreetmap.org",
