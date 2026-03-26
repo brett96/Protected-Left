@@ -15,14 +15,28 @@ export type OsrmRouteSummary = {
   durationSec: number;
   /** Distance in meters */
   distanceM: number;
+  /**
+   * Sum of per-turn risk weights (arterial / highway context costs more than lanes & courts).
+   * Filled when using only-right baseline selection.
+   */
+  weightedLeftRisk?: number;
+  /** Left maneuvers whose risk weight is at or above {@link MAJOR_ROAD_LEFT_RISK_THRESHOLD}. */
+  majorRoadLeftTurns?: number;
 };
+
+/** Weights at or above this count as a “major road” style left for summaries and tie-breaks. */
+export const MAJOR_ROAD_LEFT_RISK_THRESHOLD = 4;
 
 export type RoutableForLeftCount = {
   duration: number;
   distance: number;
   legs?: Array<{
     steps?: Array<{
-      maneuver?: { modifier?: string; location?: [number, number] };
+      name?: string;
+      ref?: string;
+      distance?: number;
+      classes?: string[];
+      maneuver?: { modifier?: string; type?: string; location?: [number, number] };
     }>;
   }>;
 };
@@ -102,6 +116,164 @@ export function pickFastestFromSummaries(summaries: OsrmRouteSummary[]): OsrmRou
     else if (a.durationSec === b.durationSec && a.distanceM < b.distanceM) bestIdx = i;
   }
   return summaries[bestIdx]!;
+}
+
+type OsrmStepForRisk = {
+  name?: string;
+  ref?: string;
+  classes?: string[];
+  maneuver?: { modifier?: string; type?: string };
+};
+
+function weightFromOsrmClasses(classes: string[] | undefined): number | null {
+  if (!classes?.length) return null;
+  if (classes.includes("motorway") || classes.includes("motorway_link")) return 14;
+  if (classes.includes("trunk")) return 11;
+  if (classes.includes("primary")) return 9;
+  if (classes.includes("secondary")) return 6;
+  if (classes.includes("tertiary")) return 3.5;
+  if (classes.includes("residential") || classes.includes("living_street")) return 1;
+  if (classes.includes("service")) return 1.3;
+  return null;
+}
+
+/**
+ * Rough road-context weight from name/ref when OSRM does not expose `classes` on steps.
+ * Higher ≈ faster / wider roads where an unprotected left is riskier.
+ */
+export function roadContextWeightFromNameRef(name: string, ref: string): number {
+  const n = name.toLowerCase().trim();
+  const r = ref.trim();
+
+  if (/\b(i|us|sr|ca|hi|az|tx|fl|ny|nv)\s*-?\s*\d+/i.test(r)) return 12;
+  if (/^(sr|sh|cr|tr)\s*-?\s*\d+/i.test(r)) return 7;
+
+  if (/\b(freeway|expressway|fwy|expy)\b/.test(n)) return 10;
+  if (/\b(highway|hwy)\b/.test(n)) return 8;
+  if (/\b(parkway|pkwy)\b/.test(n)) return 6;
+  if (/\b(boulevard|blvd)\b/.test(n)) return 5;
+  if (/\b(avenue|ave)\b/.test(n)) return 4;
+  if (/\b(street|st)\b/.test(n)) return 3;
+  if (/\b(road|rd)\b/.test(n)) return 2.5;
+  if (/\b(drive|dr)\b/.test(n)) return 2;
+  if (/\b(lane|ln)\b/.test(n)) return 1;
+  if (/\b(place|pl)\b/.test(n)) return 1;
+  if (/\b(court|ct)\b/.test(n)) return 1;
+  if (/\b(circle|cir)\b/.test(n)) return 1;
+  if (/\b(way)\b/.test(n)) return 1.5;
+  if (/\b(terrace|ter)\b/.test(n)) return 1;
+  if (/\b(trail|path)\b/.test(n)) return 1;
+  if (!n) return 2;
+  return 2.5;
+}
+
+export function roadContextWeightFromStep(step?: OsrmStepForRisk): number {
+  if (!step) return 2;
+  const cw = weightFromOsrmClasses(step.classes);
+  if (cw !== null) return cw;
+  return roadContextWeightFromNameRef(step.name ?? "", step.ref ?? "");
+}
+
+/**
+ * Risk weight for one left/U-turn maneuver: max of approach and departure road context,
+ * with U-turns always treated as high-friction.
+ */
+export function leftTurnRiskWeightForSteps(step: OsrmStepForRisk, prevStep?: OsrmStepForRisk): number {
+  const wAfter = roadContextWeightFromStep(step);
+  const wBefore = roadContextWeightFromStep(prevStep);
+  let base = Math.max(wAfter, wBefore);
+  const mod = (step.maneuver?.modifier ?? "").toLowerCase();
+  if (mod.includes("uturn")) base = Math.max(base, 9);
+  return base;
+}
+
+export function weightedLeftRiskFromRoute(route: RoutableForLeftCount): {
+  totalScore: number;
+  majorRoadLeftTurns: number;
+} {
+  let totalScore = 0;
+  let majorRoadLeftTurns = 0;
+  let prevLegLastStep: OsrmStepForRisk | undefined;
+
+  for (const leg of route.legs ?? []) {
+    const steps = leg.steps ?? [];
+    for (let si = 0; si < steps.length; si++) {
+      const step = steps[si]!;
+      const mod = step.maneuver?.modifier;
+      if (!mod) continue;
+      const m = mod.toLowerCase();
+      const type = (step.maneuver?.type ?? "").toLowerCase();
+      if (type === "depart" || type === "arrive") continue;
+      if (!(LEFT_MODIFIERS.has(mod) || m.includes("uturn") || m.includes("left"))) continue;
+
+      const prevInLeg = si > 0 ? steps[si - 1] : undefined;
+      const prev = prevInLeg ?? prevLegLastStep;
+      const w = leftTurnRiskWeightForSteps(step, prev);
+      totalScore += w;
+      if (w >= MAJOR_ROAD_LEFT_RISK_THRESHOLD) majorRoadLeftTurns++;
+    }
+    const last = steps[steps.length - 1];
+    if (last) prevLegLastStep = last;
+  }
+
+  return { totalScore, majorRoadLeftTurns };
+}
+
+function isBetterOnlyRightBaseline(a: OsrmRouteSummary, b: OsrmRouteSummary): boolean {
+  const ra = a.weightedLeftRisk ?? 0;
+  const rb = b.weightedLeftRisk ?? 0;
+  if (ra !== rb) return ra < rb;
+  const ma = a.majorRoadLeftTurns ?? 0;
+  const mb = b.majorRoadLeftTurns ?? 0;
+  if (ma !== mb) return ma < mb;
+  if (a.leftTurns !== b.leftTurns) return a.leftTurns < b.leftTurns;
+  if (a.durationSec !== b.durationSec) return a.durationSec < b.durationSec;
+  return a.distanceM < b.distanceM;
+}
+
+/**
+ * Picks the OSRM alternative that minimizes risky (arterial-style) left turns first,
+ * allowing longer neighborhood-heavy options when their weighted score is lower.
+ */
+export function pickBestOnlyRightBaseline(routes: RoutableForLeftCount[]): {
+  summaries: OsrmRouteSummary[];
+  best: OsrmRouteSummary | null;
+} {
+  if (routes.length === 0) return { summaries: [], best: null };
+  const summaries: OsrmRouteSummary[] = new Array(routes.length);
+  let bestIdx = 0;
+  for (let i = 0; i < routes.length; i++) {
+    const route = routes[i]!;
+    const leftTurns = countLeftTurnsFromRoute(route);
+    const { totalScore, majorRoadLeftTurns } = weightedLeftRiskFromRoute(route);
+    summaries[i] = {
+      index: i,
+      leftTurns,
+      durationSec: route.duration,
+      distanceM: route.distance,
+      weightedLeftRisk: totalScore,
+      majorRoadLeftTurns,
+    };
+    if (i > 0 && isBetterOnlyRightBaseline(summaries[i]!, summaries[bestIdx]!)) {
+      bestIdx = i;
+    }
+  }
+  return { summaries, best: summaries[bestIdx]! };
+}
+
+/** Full per-route summaries including risk-weighted left scores (for only-right UI / refresh). */
+export function summarizeRoutesWithRisk(routes: RoutableForLeftCount[]): OsrmRouteSummary[] {
+  return routes.map((route, index) => {
+    const { totalScore, majorRoadLeftTurns } = weightedLeftRiskFromRoute(route);
+    return {
+      index,
+      leftTurns: countLeftTurnsFromRoute(route),
+      durationSec: route.duration,
+      distanceM: route.distance,
+      weightedLeftRisk: totalScore,
+      majorRoadLeftTurns,
+    };
+  });
 }
 
 export type OnlyRightTurnsPick = {
@@ -188,9 +360,17 @@ export function formatDuration(sec: number): string {
   return `${m} min ${s} s`;
 }
 
+const METERS_PER_MILE = 1609.344;
+const FEET_PER_METER = 3.28084;
+
+/** Formats OSRM distance in meters for US-style display (miles, feet when very short). */
 export function formatDistance(m: number): string {
-  if (m >= 1000) return `${(m / 1000).toFixed(1)} km`;
-  return `${Math.round(m)} m`;
+  if (!Number.isFinite(m) || m < 0) return "—";
+  const mi = m / METERS_PER_MILE;
+  if (mi >= 10) return `${Math.round(mi)} mi`;
+  if (mi >= 0.1) return `${mi.toFixed(1)} mi`;
+  const ft = m * FEET_PER_METER;
+  return `${Math.round(ft)} ft`;
 }
 
 /** OSRM step shape needed to build spoken / UI instructions (no `instruction` field in JSON). */

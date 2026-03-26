@@ -10,14 +10,15 @@ import {
   formatDistance,
   formatDuration,
   instructionFromOsrmStep,
-  pickFastestFromSummaries,
+  pickBestOnlyRightBaseline,
   summarizeAndPickBest,
-  summarizeRoutes,
+  summarizeRoutesWithRisk,
   type OsrmRouteSummary,
 } from "./routing";
 import { addressesMatch, geocodeAddress } from "./geocode";
 import { SITE_FOOTER_HTML } from "./footer";
 import { optimizeRouteOnlyRightTurns, type DetourRouteInput } from "./onlyRightDetour";
+import { discoverNeighborhoodDetourRoutes } from "./routeDiscovery";
 import { type PhotonPlace, photonReverse } from "./photon";
 
 L.Icon.Default.mergeOptions({
@@ -75,6 +76,7 @@ type OsrmRoute = {
       name?: string;
       ref?: string;
       distance?: number;
+      classes?: string[];
       maneuver?: {
         modifier?: string;
         type?: string;
@@ -270,7 +272,7 @@ function buildApp() {
           </div>
         </div>
         <div class="controls-actions">
-          <label class="toggle-option" title="Best-effort: chooses an OSRM route with zero left/uturn maneuvers if available.">
+          <label class="toggle-option" title="Picks the OSRM alternative with the lowest risk-weighted left-turn score (arterials count more than residential streets), then tries jug-handle detours on the worst lefts first.">
             <input type="checkbox" id="only-right" />
             Only Right Turns
           </label>
@@ -291,10 +293,11 @@ function buildApp() {
       </div>
       <div class="panel" id="panel">
         <button type="button" class="panel-collapse-btn" id="panel-collapse-btn" aria-expanded="true" aria-controls="panel-inner" aria-label="Minimize route info">−</button>
+        <div class="panel-collapsed-only" id="panel-collapsed-only">Navigation Info</div>
         <div class="panel-inner" id="panel-inner">
           <p class="muted">
             Type a full street address and tap <strong>Route</strong>.  If an address isn't found, enter a nearby location, and the dropped pin can be dragged and dropped to the correct location. The app compares driving routes from <a href="https://project-osrm.org/" target="_blank" rel="noopener">OSRM</a> and picks the one with the
-            <strong>fewest left turns</strong>. This is an approximation, not a guarantee of protected left signals.
+            <strong>fewest left turns</strong>. With <strong>Only Right Turns</strong>, it also tries extra side-street paths OSRM may not list, then scores options by how risky each left is (arterials vs neighborhoods). This is an approximation, not a guarantee of protected left signals.
           </p>
           <div id="status-row" class="status-row" role="status" aria-live="polite">
             <span class="route-spinner" aria-hidden="true"></span>
@@ -784,7 +787,7 @@ function buildApp() {
     const suggestedNote =
       activeIndex === bestIndex
         ? sess.onlyRightMode
-          ? `<div class="route-picked-note">Baseline: fastest driving option among OSRM alternatives (right-turn optimization applied when needed).</div>`
+          ? `<div class="route-picked-note">Baseline: lowest risk-weighted left score among OSRM options (neighborhood lefts count less than arterials). Jug-handle tweaks target the heaviest lefts first.</div>`
           : `<div class="route-picked-note">Suggested: fewest left turns among these options</div>`
         : "";
 
@@ -807,6 +810,11 @@ function buildApp() {
       </div>`
         : `<div class="muted">Turn-by-turn steps could not be built from this route.</div>`;
 
+    const altMeta = (s: OsrmRouteSummary) =>
+      sess.onlyRightMode && s.weightedLeftRisk !== undefined
+        ? `${s.leftTurns} left · ${s.majorRoadLeftTurns ?? 0} heavy-road · score ${s.weightedLeftRisk.toFixed(1)} · ${formatDuration(s.durationSec)} · ${formatDistance(s.distanceM)}`
+        : `${s.leftTurns} left turn${s.leftTurns === 1 ? "" : "s"} · ${formatDuration(s.durationSec)} · ${formatDistance(s.distanceM)}`;
+
     const othersBlock =
       others.length > 0
         ? `<div class="route-alternatives">
@@ -817,7 +825,7 @@ function buildApp() {
                   (s) => `<li>
                 <button type="button" class="route-alt-btn" data-route-index="${s.index}">
                   <span class="route-alt-title">Option ${s.index + 1}</span>
-                  <span class="route-alt-meta">${s.leftTurns} left turn${s.leftTurns === 1 ? "" : "s"} · ${formatDuration(s.durationSec)} · ${formatDistance(s.distanceM)}</span>
+                  <span class="route-alt-meta">${altMeta(s)}</span>
                 </button>
               </li>`,
                 )
@@ -835,9 +843,11 @@ function buildApp() {
           ${strictRightNote}
         </div>
         <div class="route-displayed-stats">
-          ${current.leftTurns} left turn${current.leftTurns === 1 ? "" : "s"} ·
-          ${formatDuration(current.durationSec)} ·
-          ${formatDistance(current.distanceM)}
+          ${
+            sess.onlyRightMode && current.weightedLeftRisk !== undefined
+              ? `${current.leftTurns} left · ${current.majorRoadLeftTurns ?? 0} on heavier roads · risk score ${current.weightedLeftRisk.toFixed(1)} · ${formatDuration(current.durationSec)} · ${formatDistance(current.distanceM)}`
+              : `${current.leftTurns} left turn${current.leftTurns === 1 ? "" : "s"} · ${formatDuration(current.durationSec)} · ${formatDistance(current.distanceM)}`
+          }
         </div>
 
         ${stepsBlock}
@@ -1077,8 +1087,26 @@ function buildApp() {
         let best: OsrmRouteSummary | null;
 
         if (onlyRightMode) {
-          summaries = summarizeRoutes(routes);
-          best = pickFastestFromSummaries(summaries);
+          setOverlayCopy(
+            "Searching side-street paths\u2026",
+            "Probing snapped waypoints OSRM often omits from alternatives (neighborhood detours).",
+          );
+          try {
+            const extra = await discoverNeighborhoodDetourRoutes({
+              start: [s.lat, s.lng],
+              end: [d.lat, d.lng],
+              osrmBaseUrl: osrmBaseUrl(),
+              existingRoutes: routes,
+              fetchVia: (st, en, via) => fetchRouteViaWaypoints(st, en, via, { timeoutMs: 24000 }),
+            });
+            if (extra.length > 0) routes = [...routes, ...extra];
+          } catch {
+            // Keep OSRM alternatives only if discovery fails.
+          }
+
+          const onlyRightPick = pickBestOnlyRightBaseline(routes);
+          summaries = onlyRightPick.summaries;
+          best = onlyRightPick.best;
 
           if (!best) {
             hideRouteOverlay();
@@ -1112,19 +1140,20 @@ function buildApp() {
                 },
               });
               routes[best.index] = optimized.route as OsrmRoute;
-              summaries = summarizeRoutes(routes);
+              summaries = summarizeRoutesWithRisk(routes);
               strictOnlyRight = optimized.strict;
               allowedIndices = strictOnlyRight
                 ? summaries.filter((s) => s.leftTurns === 0).map((s) => s.index)
-                : [best.index];
+                : summaries.map((s) => s.index);
+              if (strictOnlyRight && allowedIndices.length === 0) allowedIndices = [best.index];
             } catch {
-              summaries = summarizeRoutes(routes);
+              summaries = summarizeRoutesWithRisk(routes);
               strictOnlyRight = false;
-              allowedIndices = [best.index];
+              allowedIndices = summaries.map((s) => s.index);
             }
           } else {
             strictOnlyRight = true;
-            allowedIndices = [best.index];
+            allowedIndices = summaries.map((s) => s.index);
           }
         } else {
           const normalPick = summarizeAndPickBest(routes);

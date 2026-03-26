@@ -441,6 +441,22 @@ button.secondary {
   display: none;
 }
 
+.panel-collapsed-only {
+  display: none;
+  padding: 0.35rem 2.65rem 0.35rem 0.45rem;
+  min-height: 2rem;
+  box-sizing: border-box;
+  align-items: center;
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--text);
+  line-height: 1.25;
+}
+
+.panel--collapsed .panel-collapsed-only {
+  display: flex;
+}
+
 .panel-collapse-btn {
   position: absolute;
   top: 0.45rem;

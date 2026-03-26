@@ -8,6 +8,7 @@ import {
   buildRightDetourWaypoint,
   countLeftTurnsFromRoute,
   flattenRouteStepPointsForDetour,
+  leftTurnRiskWeightForSteps,
   type RoutableForLeftCount,
   type RouteStepPoint,
 } from "./routing";
@@ -20,7 +21,10 @@ export type LatLngTuple = [number, number];
 export type DetourRouteInput = RoutableForLeftCount & {
   legs?: Array<{
     steps?: Array<{
+      name?: string;
+      ref?: string;
       distance?: number;
+      classes?: string[];
       maneuver?: {
         type?: string;
         modifier?: string;
@@ -42,6 +46,11 @@ export type FlatDetourStep = {
   bearingAfter?: number;
   prev?: LatLon;
   next?: LatLon;
+  stepName: string;
+  stepRef: string;
+  classes?: string[];
+  prevStepName?: string;
+  prevStepRef?: string;
 };
 
 const toRad = (d: number) => (d * Math.PI) / 180;
@@ -89,6 +98,8 @@ function isRoundaboutLike(t: string): boolean {
 export function flattenDetourSteps(route: DetourRouteInput): FlatDetourStep[] {
   const legs = route.legs ?? [];
   const out: FlatDetourStep[] = [];
+  let prevLegLastName = "";
+  let prevLegLastRef = "";
 
   for (let li = 0; li < legs.length; li++) {
     const steps = legs[li]!.steps ?? [];
@@ -131,6 +142,13 @@ export function flattenDetourSteps(route: DetourRouteInput): FlatDetourStep[] {
         bearingAfter = bearingBetweenPoints({ lat, lon }, next);
       }
 
+      const prevStepName =
+        si > 0 ? (steps[si - 1]!.name ?? "").trim() || undefined : prevLegLastName || undefined;
+      const prevStepRef =
+        si > 0 ? (steps[si - 1]!.ref ?? "").trim() || undefined : prevLegLastRef || undefined;
+      const stepName = (step.name ?? "").trim();
+      const stepRef = (step.ref ?? "").trim();
+
       out.push({
         lat,
         lon,
@@ -141,10 +159,34 @@ export function flattenDetourSteps(route: DetourRouteInput): FlatDetourStep[] {
         bearingAfter: bearingAfter ?? undefined,
         prev,
         next,
+        stepName,
+        stepRef,
+        classes: step.classes,
+        prevStepName,
+        prevStepRef,
       });
+    }
+    const last = steps[steps.length - 1];
+    if (last) {
+      prevLegLastName = (last.name ?? "").trim();
+      prevLegLastRef = (last.ref ?? "").trim();
     }
   }
   return out;
+}
+
+function flatLeftTurnRisk(turn: FlatDetourStep): number {
+  return leftTurnRiskWeightForSteps(
+    {
+      name: turn.stepName,
+      ref: turn.stepRef,
+      classes: turn.classes,
+      maneuver: { modifier: turn.modifier },
+    },
+    turn.prevStepName !== undefined || turn.prevStepRef !== undefined
+      ? { name: turn.prevStepName, ref: turn.prevStepRef }
+      : undefined,
+  );
 }
 
 function defaultLegMeters(step: FlatDetourStep, isUturn: boolean): number {
@@ -255,7 +297,14 @@ function alignLeftTurnsWithPolyline(route: DetourRouteInput): {
       atIndices.push(best >= 0 ? best : leftIndices[atIndices.length] ?? 0);
     }
   }
-  return { points, turns, atIndices };
+
+  const paired = turns.map((t, i) => ({ t, ai: atIndices[i]!, risk: flatLeftTurnRisk(t) }));
+  paired.sort((a, b) => b.risk - a.risk);
+  return {
+    points,
+    turns: paired.map((p) => p.t),
+    atIndices: paired.map((p) => p.ai),
+  };
 }
 
 type WaypointOpts = {
