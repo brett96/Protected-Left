@@ -191,8 +191,10 @@ function flatLeftTurnRisk(turn: FlatDetourStep): number {
 
 function defaultLegMeters(step: FlatDetourStep, isUturn: boolean): number {
   const d = step.stepDistanceM;
-  const base = Math.min(200, Math.max(90, Math.min(d * 0.52, 150)));
-  return isUturn ? Math.min(240, base * 1.4) : base;
+  // Suburban grids often require deeper “reach” than 90–200m; otherwise points snap
+  // to cul-de-sacs, parking lots, or back onto the arterial.
+  const base = Math.min(600, Math.max(150, Math.min(d * 0.75, 400)));
+  return isUturn ? Math.min(750, base * 1.4) : base;
 }
 
 /**
@@ -206,7 +208,9 @@ export function buildThreeRightCorners(lat: number, lon: number, bearingBeforeDe
   const forwardPt = destinationPoint(lat, lon, B0, d);
   const p1 = destinationPoint(forwardPt.lat, forwardPt.lon, (B0 + 90) % 360, d);
   const p2 = destinationPoint(p1.lat, p1.lon, (B0 + 180) % 360, d);
-  const p3 = destinationPoint(p2.lat, p2.lon, (B0 + 270) % 360, d * 0.6);
+  // Make the final point “commit” onto the cross street past the intersection, so OSRM
+  // is less likely to dip in then U-turn back to the arterial.
+  const p3 = destinationPoint(p2.lat, p2.lon, (B0 + 270) % 360, d);
 
   return [forwardPt, p1, p2, p3];
 }
@@ -224,7 +228,24 @@ export async function snapLatLonToRoad(
   init?: RequestInit,
   timeoutMs = 6000,
 ): Promise<{ lat: number; lon: number; snapM: number } | null> {
-  const url = `${osrmBaseUrl}/nearest/v1/driving/${lon},${lat}?number=1`;
+  const list = await snapNearestRoadCandidates(osrmBaseUrl, lat, lon, 1, init, timeoutMs);
+  return list[0] ?? null;
+}
+
+/**
+ * Multiple nearest drivable points (OSRM `number` > 1) to sample different
+ * nearby road segments around an intersection.
+ */
+export async function snapNearestRoadCandidates(
+  osrmBaseUrl: string,
+  lat: number,
+  lon: number,
+  number: number,
+  init?: RequestInit,
+  timeoutMs = 6000,
+): Promise<Array<{ lat: number; lon: number; snapM: number }>> {
+  const n = Math.min(15, Math.max(1, Math.floor(number)));
+  const url = `${osrmBaseUrl}/nearest/v1/driving/${lon},${lat}?number=${n}`;
   const controller = new AbortController();
   const tid = window.setTimeout(() => controller.abort(), timeoutMs);
   let res: Response;
@@ -233,13 +254,23 @@ export async function snapLatLonToRoad(
   } finally {
     window.clearTimeout(tid);
   }
-  if (!res.ok) return null;
+  if (!res.ok) return [];
   const data = (await res.json()) as NearestResponse;
-  if (data.code !== "Ok" || !data.waypoints?.[0]?.location) return null;
-  const [lon2, lat2] = data.waypoints[0].location;
-  const snapM = data.waypoints[0].distance ?? 0;
-  if (!Number.isFinite(lat2) || !Number.isFinite(lon2)) return null;
-  return { lat: lat2, lon: lon2, snapM };
+  if (data.code !== "Ok" || !data.waypoints?.length) return [];
+  const out: Array<{ lat: number; lon: number; snapM: number }> = [];
+  const seen = new Set<string>();
+  for (const w of data.waypoints) {
+    const loc = w.location;
+    if (!loc || loc.length < 2) continue;
+    const [lon2, lat2] = loc;
+    const snapM = w.distance ?? 0;
+    if (!Number.isFinite(lat2) || !Number.isFinite(lon2)) continue;
+    const key = `${lat2.toFixed(5)},${lon2.toFixed(5)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ lat: lat2, lon: lon2, snapM });
+  }
+  return out;
 }
 
 function haversineMeters(a: LatLon, b: LatLon): number {
@@ -314,20 +345,40 @@ type WaypointOpts = {
   skipCount?: number;
 };
 
+function jugBearingsForTurn(turn: FlatDetourStep, n: number): Array<{ bearing: number; range: number } | null> {
+  const B0 = (((turn.bearingBefore ?? 0) % 360) + 360) % 360;
+  const seq = [
+    { bearing: B0, range: 35 },
+    { bearing: (B0 + 90) % 360, range: 35 },
+    { bearing: (B0 + 180) % 360, range: 35 },
+    { bearing: (B0 + 270) % 360, range: 35 },
+  ];
+  return seq.slice(0, n);
+}
+
+function chunkFingerprint(pts: LatLon[]): string {
+  return pts.map((p) => `${p.lat.toFixed(4)},${p.lon.toFixed(4)}`).join("|");
+}
+
+function estimateJugPathMeters(pts: LatLon[]): number {
+  let s = 0;
+  for (let i = 1; i < pts.length; i++) s += haversineMeters(pts[i - 1]!, pts[i]!);
+  return s;
+}
+
 /**
- * Detour waypoints for one left maneuver (three-right pattern or nudge fallback).
- *
- * Generates candidate jug-handle corners at multiple scales (1x, 1.5x, 2x leg)
- * plus a nudge fallback, then snaps ALL candidates to roads in one parallel batch.
+ * Build several jug-handle waypoint sets for one left maneuver: anchor offsets,
+ * scales, and multiple OSRM nearest snaps on the first leg so different side
+ * streets are considered before /route chooses a path.
  */
-async function waypointsForOneTurn(
+async function buildDetourChunksForOneTurn(
   osrmBaseUrl: string,
   turn: FlatDetourStep,
   atPolylineIndex: number,
   points: RouteStepPoint[],
   existingAsLatLon: LatLon[],
   opts: WaypointOpts,
-): Promise<{ added: LatLon[]; usedThreeRight: boolean } | null> {
+): Promise<OnlyRightWaypointChunk[]> {
   const minSep = opts.minSeparationM ?? 36;
   const maxSnap = opts.maxSnapM ?? 180;
   const snapTimeout = opts.nearestTimeoutMs ?? 6000;
@@ -339,82 +390,150 @@ async function waypointsForOneTurn(
   const nudgeFallback: LatLon | null = nudgeRaw ? { lat: nudgeRaw[0], lon: nudgeRaw[1] } : null;
 
   if (useSimpleRoundabout || turn.bearingBefore === undefined || turn.bearingBefore === null) {
-    if (!nudgeFallback) return null;
-    if (tooCloseToAny(nudgeFallback, existingAsLatLon, minSep)) return null;
+    if (!nudgeFallback) return [];
+    if (tooCloseToAny(nudgeFallback, existingAsLatLon, minSep)) return [];
     const snap = await snapLatLonToRoad(osrmBaseUrl, nudgeFallback.lat, nudgeFallback.lon, undefined, snapTimeout);
     const point = snap && snap.snapM <= maxSnap ? { lat: snap.lat, lon: snap.lon } : nudgeFallback;
-    return { added: [point], usedThreeRight: false };
+    return [{ added: [point], usedThreeRight: false, bearings: [null], radiuses: [55] }];
   }
 
-  const GROUP_NUDGE = -1;
+  const B0 = (((turn.bearingBefore % 360) + 360) % 360);
   const legM = defaultLegMeters(turn, isUturn);
-  /** Expand leg length on later groups (wider suburban / grid blocks), never shrink. */
-  const scaleFactors = [1.0, 1.5, 2.0];
+  /** Small set of anchor/scale mixes so /nearest work stays within pass time budget. */
+  const anchorCombos: Array<{ forwardM: number; lateralM: number; scale: number }> = [
+    { forwardM: 0, lateralM: 0, scale: 1 },
+    { forwardM: 45, lateralM: 0, scale: 1.75 },
+    { forwardM: -30, lateralM: 0, scale: 2.25 },
+    { forwardM: 0, lateralM: 55, scale: 2 },
+    { forwardM: 40, lateralM: 55, scale: 2.5 },
+    { forwardM: 0, lateralM: 0, scale: 2.75 },
+  ];
 
-  type Candidate = { groupIdx: number; point: LatLon };
-  const candidates: Candidate[] = [];
+  type RawJug = { pts: LatLon[]; leg: number };
+  const rawJugs: RawJug[] = [];
+  for (const { forwardM, lateralM, scale } of anchorCombos) {
+    const along = destinationPoint(turn.lat, turn.lon, B0, forwardM);
+    const anchor =
+      lateralM === 0 ? along : destinationPoint(along.lat, along.lon, (B0 + 90) % 360, lateralM);
+    const leg = Math.max(150, Math.min(800, legM * scale));
+    rawJugs.push({ pts: buildThreeRightCorners(anchor.lat, anchor.lon, B0, leg), leg });
+  }
 
-  for (let gi = 0; gi < scaleFactors.length; gi++) {
-    const leg = Math.max(90, Math.min(300, legM * scaleFactors[gi]!));
-    const corners = buildThreeRightCorners(turn.lat, turn.lon, turn.bearingBefore, leg);
-    for (const c of corners) {
-      if (!tooCloseToAny(c, existingAsLatLon, minSep)) {
-        candidates.push({ groupIdx: gi, point: c });
+  const chunks: OnlyRightWaypointChunk[] = [];
+  const seenFp = new Set<string>();
+  const maxChunks = 8;
+  const maxForwardSnaps = 2;
+
+  for (const { pts: idealFour, leg: legSeg } of rawJugs) {
+    if (chunks.length >= maxChunks) break;
+    const forwardIdeal = idealFour[0]!;
+    if (tooCloseToAny(forwardIdeal, existingAsLatLon, minSep)) continue;
+
+    const forwardChoices = await snapNearestRoadCandidates(
+      osrmBaseUrl,
+      forwardIdeal.lat,
+      forwardIdeal.lon,
+      6,
+      undefined,
+      snapTimeout,
+    );
+    const forwards = forwardChoices.filter((c) => c.snapM <= maxSnap).slice(0, maxForwardSnaps);
+    if (forwards.length === 0) continue;
+
+    for (const f0 of forwards) {
+      if (chunks.length >= maxChunks) break;
+      if (tooCloseToAny(f0, existingAsLatLon, minSep)) continue;
+
+      const p1 = destinationPoint(f0.lat, f0.lon, (B0 + 90) % 360, legSeg);
+      const p2 = destinationPoint(p1.lat, p1.lon, (B0 + 180) % 360, legSeg);
+      const p3 = destinationPoint(p2.lat, p2.lon, (B0 + 270) % 360, legSeg);
+      const toSnap = [p1, p2, p3];
+
+      const snaps = await Promise.all(
+        toSnap.map((p) => snapLatLonToRoad(osrmBaseUrl, p.lat, p.lon, undefined, snapTimeout)),
+      );
+
+      const groupPoints: LatLon[] = [f0];
+      for (let i = 0; i < snaps.length; i++) {
+        const s = snaps[i]!;
+        const raw = toSnap[i]!;
+        const pt =
+          s && s.snapM <= maxSnap ? { lat: s.lat, lon: s.lon } : raw;
+        if (tooCloseToAny(pt, [...existingAsLatLon, ...groupPoints], minSep)) {
+          groupPoints.length = 0;
+          break;
+        }
+        groupPoints.push(pt);
       }
+
+      if (groupPoints.length !== 4) continue;
+
+      const fp = chunkFingerprint(groupPoints);
+      if (seenFp.has(fp)) continue;
+      seenFp.add(fp);
+
+      chunks.push({
+        added: groupPoints,
+        usedThreeRight: true,
+        bearings: jugBearingsForTurn(turn, 4),
+        radiuses: [45, 45, 45, 45],
+      });
     }
   }
+
+  chunks.sort((a, b) => estimateJugPathMeters(a.added) - estimateJugPathMeters(b.added));
 
   if (nudgeFallback && !tooCloseToAny(nudgeFallback, existingAsLatLon, minSep)) {
-    candidates.push({ groupIdx: GROUP_NUDGE, point: nudgeFallback });
+    const snap = await snapLatLonToRoad(osrmBaseUrl, nudgeFallback.lat, nudgeFallback.lon, undefined, snapTimeout);
+    const point = snap && snap.snapM <= maxSnap ? { lat: snap.lat, lon: snap.lon } : nudgeFallback;
+    chunks.push({ added: [point], usedThreeRight: false, bearings: [null], radiuses: [55] });
   }
 
-  if (candidates.length === 0) return null;
-
-  const snapResults = await Promise.allSettled(
-    candidates.map((c) => snapLatLonToRoad(osrmBaseUrl, c.point.lat, c.point.lon, undefined, snapTimeout)),
-  );
-
-  const resolved = candidates.map((c, i) => {
-    const r = snapResults[i]!;
-    if (r.status === "fulfilled" && r.value && r.value.snapM <= maxSnap) {
-      return { groupIdx: c.groupIdx, point: { lat: r.value.lat, lon: r.value.lon } };
-    }
-    return { groupIdx: c.groupIdx, point: c.point };
-  });
-
-  for (let gi = 0; gi < scaleFactors.length; gi++) {
-    const groupPoints = resolved.filter((r) => r.groupIdx === gi).map((r) => r.point);
-    if (groupPoints.length >= 3) {
-      return { added: groupPoints, usedThreeRight: true };
-    }
-  }
-
-  const nudgeResolved = resolved.find((r) => r.groupIdx === GROUP_NUDGE);
-  if (nudgeResolved) {
-    return { added: [nudgeResolved.point], usedThreeRight: false };
-  }
-
-  return null;
+  return chunks;
 }
+
+export type OnlyRightWaypointChunk = {
+  added: LatLon[];
+  usedThreeRight: boolean;
+  bearings?: Array<{ bearing: number; range: number } | null>;
+  radiuses?: Array<number | null>;
+};
 
 /**
  * Produce up to four road-snapped jug-handle waypoints or a single nudge waypoint
  * for the Nth remaining left-like maneuver (`opts.skipCount`, default 0).
  */
+export async function buildDetourChunksForNextLeft(
+  route: DetourRouteInput,
+  osrmBaseUrl: string,
+  existingWaypoints: LatLngTuple[],
+  opts?: WaypointOpts,
+): Promise<OnlyRightWaypointChunk[]> {
+  const { points, turns, atIndices } = alignLeftTurnsWithPolyline(route);
+  if (turns.length === 0) return [];
+
+  const targetIdx = opts?.skipCount ?? 0;
+  if (targetIdx >= turns.length) return [];
+
+  const existingAsLatLon: LatLon[] = existingWaypoints.map(([lat, lon]) => ({ lat, lon }));
+  return buildDetourChunksForOneTurn(
+    osrmBaseUrl,
+    turns[targetIdx]!,
+    atIndices[targetIdx]!,
+    points,
+    existingAsLatLon,
+    opts ?? {},
+  );
+}
+
 export async function buildNextOnlyRightWaypoints(
   route: DetourRouteInput,
   osrmBaseUrl: string,
   existingWaypoints: LatLngTuple[],
   opts?: WaypointOpts,
-): Promise<{ added: LatLon[]; usedThreeRight: boolean } | null> {
-  const { points, turns, atIndices } = alignLeftTurnsWithPolyline(route);
-  if (turns.length === 0) return null;
-
-  const targetIdx = opts?.skipCount ?? 0;
-  if (targetIdx >= turns.length) return null;
-
-  const existingAsLatLon: LatLon[] = existingWaypoints.map(([lat, lon]) => ({ lat, lon }));
-  return waypointsForOneTurn(osrmBaseUrl, turns[targetIdx]!, atIndices[targetIdx]!, points, existingAsLatLon, opts ?? {});
+): Promise<OnlyRightWaypointChunk | null> {
+  const chunks = await buildDetourChunksForNextLeft(route, osrmBaseUrl, existingWaypoints, opts);
+  return chunks[0] ?? null;
 }
 
 export type OptimizeOnlyRightOptions = {
@@ -427,27 +546,40 @@ export type OptimizeOnlyRightOptions = {
     start: LatLngTuple,
     end: LatLngTuple,
     via: LatLngTuple[],
-    opts?: { timeoutMs?: number },
+    opts?: {
+      timeoutMs?: number;
+      /** Optional OSRM bearings param entries for *via points only* (start/end handled by caller). */
+      viaBearings?: Array<{ bearing: number; range: number } | null>;
+      /** Optional OSRM radiuses param entries for *via points only* (start/end handled by caller). */
+      viaRadiuses?: Array<number | null>;
+    },
   ) => Promise<DetourRouteInput>;
+  /** Number of optimization passes (each targets the next worst remaining left). Default 3. */
   maxIterations?: number;
   maxTotalWaypoints?: number;
   /** Minimum time budget for OSRM /route with intermediate waypoints (see main.ts scaling). */
   routeTimeoutMs?: number;
   /** Per /nearest snap call; each snap uses its own timer. */
   nearestTimeoutMs?: number;
-  /** Hard wall-clock budget for the entire optimization pass. */
-  timeBudgetMs?: number;
-  /** Called after each iteration so the UI can show progress. */
-  onProgress?: (info: { iteration: number; leftTurns: number; elapsedMs: number }) => void;
+  /** Wall-clock budget per pass (trying detour candidates for one left). Default 5000ms. */
+  timeBudgetMsPerPass?: number;
+  /** Called when pass state changes (start of pass, after a successful conversion). */
+  onProgress?: (info: {
+    pass: number;
+    passMax: number;
+    leftTurns: number;
+    passElapsedMs: number;
+    totalElapsedMs: number;
+  }) => void;
 };
 
 /**
  * Iteratively adds detour waypoints to eliminate left turns one at a time.
  *
- * When a particular left turn can't be eliminated (waypoints don't reduce the
- * total left-turn count), the optimizer skips it and tries the next remaining
- * left turn instead of giving up entirely.  A wall-clock time budget prevents
- * the process from hanging indefinitely.
+ * When a particular left turn can't be eliminated (no candidate detour strictly
+ * reduces the left-turn count), the optimizer skips it and tries the next
+ * remaining left on the next pass. Loops that keep the same number of lefts
+ * (e.g. trading an arterial left for a residential left) are rejected.
  */
 export async function optimizeRouteOnlyRightTurns(
   options: OptimizeOnlyRightOptions,
@@ -458,11 +590,11 @@ export async function optimizeRouteOnlyRightTurns(
     end,
     baseRoute,
     fetchRouteViaWaypoints,
-    maxIterations = 12,
+    maxIterations = 3,
     maxTotalWaypoints = 22,
-    routeTimeoutMs = 24000,
-    nearestTimeoutMs = 6000,
-    timeBudgetMs = 45000,
+    routeTimeoutMs = 4500,
+    nearestTimeoutMs = 3500,
+    timeBudgetMsPerPass = 5000,
     onProgress,
   } = options;
 
@@ -476,22 +608,33 @@ export async function optimizeRouteOnlyRightTurns(
   let prevLeft = baselineLeft;
   let skipCount = 0;
   const t0 = Date.now();
+  const passMax = maxIterations;
+
+  const emitProgress = (pass: number, passStart: number) => {
+    const now = Date.now();
+    onProgress?.({
+      pass,
+      passMax,
+      leftTurns: countLeftTurnsFromRoute(workingRoute),
+      passElapsedMs: now - passStart,
+      totalElapsedMs: now - t0,
+    });
+  };
 
   for (let iter = 0; iter < maxIterations; iter++) {
-    const elapsedMs = Date.now() - t0;
-    if (elapsedMs > timeBudgetMs) break;
-
+    const passStart = Date.now();
     const currentLeft = countLeftTurnsFromRoute(workingRoute);
-    onProgress?.({ iteration: iter, leftTurns: currentLeft, elapsedMs });
+    emitProgress(iter + 1, passStart);
+
     if (currentLeft === 0) {
       return { route: workingRoute, waypoints, strict: true };
     }
 
     if (skipCount >= currentLeft) break;
 
-    let chunk: Awaited<ReturnType<typeof buildNextOnlyRightWaypoints>>;
+    let chunks: OnlyRightWaypointChunk[];
     try {
-      chunk = await buildNextOnlyRightWaypoints(workingRoute, osrmBaseUrl, waypoints, {
+      chunks = await buildDetourChunksForNextLeft(workingRoute, osrmBaseUrl, waypoints, {
         nearestTimeoutMs,
         skipCount,
       });
@@ -499,36 +642,45 @@ export async function optimizeRouteOnlyRightTurns(
       skipCount++;
       continue;
     }
-    if (!chunk || chunk.added.length === 0) {
+    if (chunks.length === 0) {
       skipCount++;
       continue;
     }
 
-    const candidateWps: LatLngTuple[] = [
-      ...waypoints,
-      ...chunk.added.map((p): LatLngTuple => [p.lat, p.lon]),
-    ];
-    if (candidateWps.length > maxTotalWaypoints) {
-      skipCount++;
-      continue;
-    }
+    let accepted = false;
+    for (const chunk of chunks) {
+      if (Date.now() - passStart > timeBudgetMsPerPass) break;
 
-    try {
-      const modified = await fetchRouteViaWaypoints(start, end, candidateWps, {
-        timeoutMs: routeTimeoutMs,
-      });
-      const newLeft = countLeftTurnsFromRoute(modified);
-      if (newLeft < prevLeft) {
-        prevLeft = newLeft;
-        workingRoute = modified;
-        waypoints = candidateWps;
-        skipCount = 0;
-      } else {
-        skipCount++;
+      const candidateWps: LatLngTuple[] = [
+        ...waypoints,
+        ...chunk.added.map((p): LatLngTuple => [p.lat, p.lon]),
+      ];
+      if (candidateWps.length > maxTotalWaypoints) continue;
+
+      try {
+        const modified = await fetchRouteViaWaypoints(start, end, candidateWps, {
+          timeoutMs: routeTimeoutMs,
+          viaBearings: chunk.bearings,
+          viaRadiuses: chunk.radiuses,
+        });
+        const newLeft = countLeftTurnsFromRoute(modified);
+        // Only accept detours that remove at least one left; avoids huge loops
+        // that do not improve only-right feasibility.
+        if (newLeft < prevLeft) {
+          prevLeft = newLeft;
+          workingRoute = modified;
+          waypoints = candidateWps;
+          skipCount = 0;
+          accepted = true;
+          emitProgress(iter + 1, passStart);
+          break;
+        }
+      } catch {
+        /* try next chunk */
       }
-    } catch {
-      skipCount++;
     }
+
+    if (!accepted) skipCount++;
   }
 
   const finalLeft = countLeftTurnsFromRoute(workingRoute);

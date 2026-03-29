@@ -148,8 +148,9 @@ async function fetchRoutes(
     const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
     try {
       const params = new URLSearchParams({
-        // Reduce payload/processing cost; we still request steps for turn counting.
-        overview: "simplified",
+        // `full` keeps every shape point so the map follows actual roads; `simplified`
+        // chops vertices and reads as straight chords across curves.
+        overview: "full",
         geometries: "geojson",
         steps: "true",
         alternatives: alternatives ? "true" : "false",
@@ -185,11 +186,15 @@ async function fetchRouteViaWaypoints(
   start: L.LatLngTuple,
   end: L.LatLngTuple,
   via: L.LatLngTuple[],
-  opts?: { timeoutMs?: number },
+  opts?: {
+    timeoutMs?: number;
+    viaBearings?: Array<{ bearing: number; range: number } | null>;
+    viaRadiuses?: Array<number | null>;
+  },
 ): Promise<OsrmRoute> {
   const viaCount = via.length;
-  const scaled = Math.min(50000, 15000 + viaCount * 2000);
-  const budgetMs = opts?.timeoutMs !== undefined ? Math.max(opts.timeoutMs, scaled) : scaled;
+  const defaultBudget = Math.min(12000, 5000 + viaCount * 900);
+  const budgetMs = opts?.timeoutMs !== undefined ? opts.timeoutMs : defaultBudget;
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), budgetMs);
 
@@ -199,11 +204,33 @@ async function fetchRouteViaWaypoints(
     .join(";");
 
   const params = new URLSearchParams({
-    overview: "simplified",
+    overview: "full",
     geometries: "geojson",
     steps: "true",
     alternatives: "false",
   });
+
+  const vb = opts?.viaBearings;
+  if (vb && vb.length === viaCount) {
+    const bearingParts: string[] = ["0,180"];
+    for (let i = 0; i < viaCount; i++) {
+      const b = vb[i];
+      bearingParts.push(b ? `${Math.round(b.bearing)},${Math.round(b.range)}` : "0,180");
+    }
+    bearingParts.push("0,180");
+    params.set("bearings", bearingParts.join(";"));
+  }
+
+  const vr = opts?.viaRadiuses;
+  if (vr && vr.length === viaCount) {
+    const radiusParts: string[] = ["unlimited"];
+    for (let i = 0; i < viaCount; i++) {
+      const r = vr[i];
+      radiusParts.push(r != null && Number.isFinite(r) ? String(Math.round(r)) : "unlimited");
+    }
+    radiusParts.push("unlimited");
+    params.set("radiuses", radiusParts.join(";"));
+  }
 
   const url = `${osrmBaseUrl()}/route/v1/driving/${coords}?${params}`;
   try {
@@ -1115,10 +1142,21 @@ function buildApp() {
           }
 
           if (best.leftTurns > 0) {
-            setOverlayCopy(
-              "Optimizing for right turns only\u2026",
-              `Converting ${best.leftTurns} left turn${best.leftTurns === 1 ? "" : "s"} into right-turn loops (snapping to roads).`,
-            );
+            const uiPass = {
+              pass: 1,
+              passMax: 3,
+              leftTurns: best.leftTurns,
+              t0: Date.now(),
+            };
+            const tickOptimizeOverlay = () => {
+              const elapsedSec = Math.floor((Date.now() - uiPass.t0) / 1000);
+              setOverlayCopy(
+                "Optimizing for right turns only\u2026",
+                `Pass ${uiPass.pass}/${uiPass.passMax} · ${uiPass.leftTurns} left turn${uiPass.leftTurns === 1 ? "" : "s"} · ${elapsedSec}s elapsed`,
+              );
+            };
+            tickOptimizeOverlay();
+            const optimizeTick = window.setInterval(tickOptimizeOverlay, 1000);
             try {
               const optimized = await optimizeRouteOnlyRightTurns({
                 osrmBaseUrl: osrmBaseUrl(),
@@ -1126,17 +1164,15 @@ function buildApp() {
                 end: [destPlace.lat, destPlace.lon],
                 baseRoute: routes[best.index]! as DetourRouteInput,
                 fetchRouteViaWaypoints: (s, e, via, o) => fetchRouteViaWaypoints(s, e, via, o),
-                maxIterations: 12,
+                maxIterations: 3,
                 maxTotalWaypoints: 22,
-                routeTimeoutMs: 26000,
-                nearestTimeoutMs: 6000,
-                timeBudgetMs: 45000,
-                onProgress: ({ iteration, leftTurns, elapsedMs }) => {
-                  const sec = Math.round(elapsedMs / 1000);
-                  setOverlayCopy(
-                    "Optimizing for right turns only\u2026",
-                    `Pass ${iteration + 1}: ${leftTurns} left turn${leftTurns === 1 ? "" : "s"} remaining (${sec}s)`,
-                  );
+                routeTimeoutMs: 4500,
+                nearestTimeoutMs: 3500,
+                timeBudgetMsPerPass: 5000,
+                onProgress: (info) => {
+                  uiPass.pass = info.pass;
+                  uiPass.passMax = info.passMax;
+                  uiPass.leftTurns = info.leftTurns;
                 },
               });
               routes[best.index] = optimized.route as OsrmRoute;
@@ -1150,6 +1186,8 @@ function buildApp() {
               summaries = summarizeRoutesWithRisk(routes);
               strictOnlyRight = false;
               allowedIndices = summaries.map((s) => s.index);
+            } finally {
+              window.clearInterval(optimizeTick);
             }
           } else {
             strictOnlyRight = true;
