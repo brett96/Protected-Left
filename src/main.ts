@@ -1,3 +1,4 @@
+import "./vercelAnalytics";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
 import markerIcon2x from "leaflet/dist/images/marker-icon-2x.png";

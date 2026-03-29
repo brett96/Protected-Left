@@ -1,3 +1,4 @@
+import "./vercelAnalytics";
 import "./style.css";
 import { SITE_FOOTER_HTML } from "./footer";
 
