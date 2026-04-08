@@ -1126,6 +1126,9 @@ function buildApp() {
               osrmBaseUrl: osrmBaseUrl(),
               existingRoutes: routes,
               fetchVia: (st, en, via) => fetchRouteViaWaypoints(st, en, via, { timeoutMs: 24000 }),
+              maxRouteAttempts: 20,
+              maxDiscoveredRoutes: 12,
+              maxDurationRatioVsFastest: 4.0,
             });
             if (extra.length > 0) routes = [...routes, ...extra];
           } catch {
@@ -1145,7 +1148,7 @@ function buildApp() {
           if (best.leftTurns > 0) {
             const uiPass = {
               pass: 1,
-              passMax: 3,
+              passMax: 6,
               leftTurns: best.leftTurns,
               t0: Date.now(),
             };
@@ -1165,11 +1168,11 @@ function buildApp() {
                 end: [destPlace.lat, destPlace.lon],
                 baseRoute: routes[best.index]! as DetourRouteInput,
                 fetchRouteViaWaypoints: (s, e, via, o) => fetchRouteViaWaypoints(s, e, via, o),
-                maxIterations: 3,
-                maxTotalWaypoints: 22,
-                routeTimeoutMs: 4500,
+                maxIterations: 6,
+                maxTotalWaypoints: 30,
+                routeTimeoutMs: 6000,
                 nearestTimeoutMs: 3500,
-                timeBudgetMsPerPass: 5000,
+                timeBudgetMsPerPass: 8000,
                 onProgress: (info) => {
                   uiPass.pass = info.pass;
                   uiPass.passMax = info.passMax;

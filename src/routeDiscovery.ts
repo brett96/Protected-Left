@@ -63,6 +63,18 @@ function perpOffsets(anchor: LatLon, bearingAlongChord: number, distancesM: numb
   return out;
 }
 
+/** Diagonal offsets at +-45 deg from the chord bearing (catches routes that aren't strictly perpendicular). */
+function diagOffsets(anchor: LatLon, bearingAlongChord: number, distancesM: number[]): LatLon[] {
+  const out: LatLon[] = [];
+  const angles = [45, 135, 225, 315];
+  for (const d of distancesM) {
+    for (const a of angles) {
+      out.push(destinationPoint(anchor.lat, anchor.lon, (bearingAlongChord + a) % 360, d));
+    }
+  }
+  return out;
+}
+
 /**
  * Build ordered probe anchors along A→B so we try “bend early / late / mid” into side streets.
  */
@@ -74,18 +86,22 @@ function buildRawProbePoints(a: LatLon, b: LatLon): LatLon[] {
   const out: LatLon[] = [];
 
   const mid = destinationPoint(a.lat, a.lon, bear, dist * 0.5);
-  out.push(...perpOffsets(mid, bear, [400, 260, 130]));
+  out.push(...perpOffsets(mid, bear, [800, 600, 400, 260, 130]));
 
   const nearStart = destinationPoint(a.lat, a.lon, bear, Math.min(dist * 0.2, 900));
-  out.push(...perpOffsets(nearStart, bear, [220, 110]));
+  out.push(...perpOffsets(nearStart, bear, [600, 350, 220, 110]));
 
   const nearEnd = destinationPoint(a.lat, a.lon, bear, Math.max(dist * 0.8, dist - 700));
-  out.push(...perpOffsets(nearEnd, bear, [220, 110]));
+  out.push(...perpOffsets(nearEnd, bear, [600, 350, 220, 110]));
 
   const q1 = destinationPoint(a.lat, a.lon, bear, dist * 0.35);
   const q2 = destinationPoint(a.lat, a.lon, bear, dist * 0.65);
-  out.push(...perpOffsets(q1, bear, [170]));
-  out.push(...perpOffsets(q2, bear, [170]));
+  out.push(...perpOffsets(q1, bear, [400, 170]));
+  out.push(...perpOffsets(q2, bear, [400, 170]));
+
+  out.push(...diagOffsets(mid, bear, [500, 300]));
+  out.push(...diagOffsets(q1, bear, [350]));
+  out.push(...diagOffsets(q2, bear, [350]));
 
   return out;
 }
@@ -125,9 +141,9 @@ export async function discoverNeighborhoodDetourRoutes<T extends { duration: num
     fetchVia,
     maxSnapM = 220,
     nearestTimeoutMs = 6000,
-    maxRouteAttempts = 14,
-    maxDiscoveredRoutes = 8,
-    maxDurationRatioVsFastest = 3.15,
+    maxRouteAttempts = 20,
+    maxDiscoveredRoutes = 12,
+    maxDurationRatioVsFastest = 4.0,
     minExtraDistanceM = 70,
   } = options;
 

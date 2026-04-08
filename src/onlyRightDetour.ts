@@ -9,6 +9,7 @@ import {
   countLeftTurnsFromRoute,
   flattenRouteStepPointsForDetour,
   leftTurnRiskWeightForSteps,
+  weightedLeftRiskFromRoute,
   type RoutableForLeftCount,
   type RouteStepPoint,
 } from "./routing";
@@ -193,8 +194,12 @@ function defaultLegMeters(step: FlatDetourStep, isUturn: boolean): number {
   const d = step.stepDistanceM;
   // Suburban grids often require deeper “reach” than 90–200m; otherwise points snap
   // to cul-de-sacs, parking lots, or back onto the arterial.
-  const base = Math.min(600, Math.max(150, Math.min(d * 0.75, 400)));
-  return isUturn ? Math.min(750, base * 1.4) : base;
+  const risk = flatLeftTurnRisk(step);
+  // High-risk lefts (arterials) need deeper reach to clear into parallel
+  // neighborhood streets; low-risk lefts keep the tighter original range.
+  const riskCap = risk >= 5 ? 900 : 600;
+  const base = Math.min(riskCap, Math.max(150, Math.min(d * 0.75, 500)));
+  return isUturn ? Math.min(1000, base * 1.4) : base;
 }
 
 /**
@@ -399,7 +404,6 @@ async function buildDetourChunksForOneTurn(
 
   const B0 = (((turn.bearingBefore % 360) + 360) % 360);
   const legM = defaultLegMeters(turn, isUturn);
-  /** Small set of anchor/scale mixes so /nearest work stays within pass time budget. */
   const anchorCombos: Array<{ forwardM: number; lateralM: number; scale: number }> = [
     { forwardM: 0, lateralM: 0, scale: 1 },
     { forwardM: 45, lateralM: 0, scale: 1.75 },
@@ -407,6 +411,10 @@ async function buildDetourChunksForOneTurn(
     { forwardM: 0, lateralM: 55, scale: 2 },
     { forwardM: 40, lateralM: 55, scale: 2.5 },
     { forwardM: 0, lateralM: 0, scale: 2.75 },
+    { forwardM: 0, lateralM: 100, scale: 3.0 },
+    { forwardM: 60, lateralM: 100, scale: 3.0 },
+    { forwardM: 0, lateralM: 150, scale: 3.5 },
+    { forwardM: -40, lateralM: 150, scale: 3.5 },
   ];
 
   type RawJug = { pts: LatLon[]; leg: number };
@@ -415,13 +423,13 @@ async function buildDetourChunksForOneTurn(
     const along = destinationPoint(turn.lat, turn.lon, B0, forwardM);
     const anchor =
       lateralM === 0 ? along : destinationPoint(along.lat, along.lon, (B0 + 90) % 360, lateralM);
-    const leg = Math.max(150, Math.min(800, legM * scale));
+    const leg = Math.max(150, Math.min(1100, legM * scale));
     rawJugs.push({ pts: buildThreeRightCorners(anchor.lat, anchor.lon, B0, leg), leg });
   }
 
   const chunks: OnlyRightWaypointChunk[] = [];
   const seenFp = new Set<string>();
-  const maxChunks = 8;
+  const maxChunks = 12;
   const maxForwardSnaps = 2;
 
   for (const { pts: idealFour, leg: legSeg } of rawJugs) {
@@ -554,9 +562,15 @@ export type OptimizeOnlyRightOptions = {
       viaRadiuses?: Array<number | null>;
     },
   ) => Promise<DetourRouteInput>;
-  /** Number of optimization passes (each targets the next worst remaining left). Default 3. */
+  /** Number of optimization passes (each targets the next worst remaining left). Default 6. */
   maxIterations?: number;
   maxTotalWaypoints?: number;
+  /**
+   * Max additional left turns allowed vs the baseline when accepting a
+   * risk-improving detour (e.g. trading one arterial left for several
+   * neighborhood lefts). Default 4.
+   */
+  maxLeftCountIncrease?: number;
   /** Minimum time budget for OSRM /route with intermediate waypoints (see main.ts scaling). */
   routeTimeoutMs?: number;
   /** Per /nearest snap call; each snap uses its own timer. */
@@ -576,10 +590,10 @@ export type OptimizeOnlyRightOptions = {
 /**
  * Iteratively adds detour waypoints to eliminate left turns one at a time.
  *
- * When a particular left turn can't be eliminated (no candidate detour strictly
- * reduces the left-turn count), the optimizer skips it and tries the next
- * remaining left on the next pass. Loops that keep the same number of lefts
- * (e.g. trading an arterial left for a residential left) are rejected.
+ * Accepts a candidate when it either reduces the raw left-turn count *or*
+ * reduces the risk-weighted left score (allowing safe neighborhood lefts to
+ * replace dangerous arterial lefts). A hard cap on additional left count
+ * prevents runaway detours.
  */
 export async function optimizeRouteOnlyRightTurns(
   options: OptimizeOnlyRightOptions,
@@ -590,11 +604,12 @@ export async function optimizeRouteOnlyRightTurns(
     end,
     baseRoute,
     fetchRouteViaWaypoints,
-    maxIterations = 3,
-    maxTotalWaypoints = 22,
-    routeTimeoutMs = 4500,
+    maxIterations = 6,
+    maxTotalWaypoints = 30,
+    maxLeftCountIncrease = 4,
+    routeTimeoutMs = 6000,
     nearestTimeoutMs = 3500,
-    timeBudgetMsPerPass = 5000,
+    timeBudgetMsPerPass = 8000,
     onProgress,
   } = options;
 
@@ -603,9 +618,12 @@ export async function optimizeRouteOnlyRightTurns(
     return { route: baseRoute, waypoints: [], strict: true };
   }
 
+  const baselineRisk = weightedLeftRiskFromRoute(baseRoute).totalScore;
+
   let workingRoute: DetourRouteInput = baseRoute;
   let waypoints: LatLngTuple[] = [];
   let prevLeft = baselineLeft;
+  let prevRisk = baselineRisk;
   let skipCount = 0;
   const t0 = Date.now();
   const passMax = maxIterations;
@@ -664,10 +682,15 @@ export async function optimizeRouteOnlyRightTurns(
           viaRadiuses: chunk.radiuses,
         });
         const newLeft = countLeftTurnsFromRoute(modified);
-        // Only accept detours that remove at least one left; avoids huge loops
-        // that do not improve only-right feasibility.
-        if (newLeft < prevLeft) {
+        const { totalScore: newRisk } = weightedLeftRiskFromRoute(modified);
+
+        const countImproved = newLeft < prevLeft;
+        const riskImproved = newRisk < prevRisk;
+        const notRunaway = newLeft <= baselineLeft + maxLeftCountIncrease;
+
+        if ((countImproved || riskImproved) && notRunaway) {
           prevLeft = newLeft;
+          prevRisk = newRisk;
           workingRoute = modified;
           waypoints = candidateWps;
           skipCount = 0;
@@ -684,7 +707,8 @@ export async function optimizeRouteOnlyRightTurns(
   }
 
   const finalLeft = countLeftTurnsFromRoute(workingRoute);
-  if (finalLeft > baselineLeft) {
+  const finalRisk = weightedLeftRiskFromRoute(workingRoute).totalScore;
+  if (finalLeft > baselineLeft && finalRisk >= baselineRisk) {
     return { route: baseRoute, waypoints: [], strict: false };
   }
 
